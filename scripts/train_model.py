@@ -332,21 +332,22 @@ def main():
     """Main training workflow."""
     args = parse_args()
     
-    # Configure JAX platform if specified
+    # Configure JAX platform if specified (before importing JAX)
     if args.jax_platform:
         import os
         os.environ['JAX_PLATFORM_NAME'] = args.jax_platform
-        logger.info(f"JAX platform set to: {args.jax_platform}")
+        print(f"JAX platform set to: {args.jax_platform}")
     
-    # Set XLA flags if specified
+    # Set XLA flags if specified (before importing JAX)
     if args.xla_flags:
         import os
         os.environ['XLA_FLAGS'] = args.xla_flags
-        logger.info(f"XLA flags set to: {args.xla_flags}")
+        print(f"XLA flags set to: {args.xla_flags}")
     
     # Import JAX after environment variables are set
     import jax
     
+    # Setup logging after JAX is imported
     setup_logging(args.output_dir, args.verbose)
     
     logger = logging.getLogger(__name__)
