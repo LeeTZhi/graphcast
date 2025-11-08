@@ -123,6 +123,14 @@ def parse_args():
         help='Number of 12-hour prediction steps (for multi-step mode)'
     )
     
+    # Data windowing
+    parser.add_argument(
+        '--window-size',
+        type=int,
+        default=6,
+        help='Number of historical timesteps to use as input (default: 6 for 3 days)'
+    )
+    
     # Region configuration (should match training)
     parser.add_argument(
         '--downstream-lat-min',
@@ -666,6 +674,7 @@ def main():
                 data=dataset,
                 target_time=target_time,
                 rng=rng,
+                window_size=args.window_size,
             )
         else:  # multi-step
             predictions = pipeline.predict_sequence(
@@ -673,6 +682,7 @@ def main():
                 initial_time=initial_time,
                 num_steps=args.num_steps,
                 rng=rng,
+                window_size=args.window_size,
             )
         
         logger.info("=" * 80)

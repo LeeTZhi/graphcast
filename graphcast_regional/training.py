@@ -150,7 +150,7 @@ def create_train_val_test_split(
     data: xr.Dataset,
     train_end_year: Optional[int] = None,
     val_end_year: Optional[int] = None,
-    train_ratio: float = 0.7,
+    train_ratio: float = 0.85,
     val_ratio: float = 0.15,
     test_start_date: Optional[str] = None,
 ) -> Tuple[xr.Dataset, xr.Dataset, xr.Dataset]:
@@ -243,18 +243,18 @@ def create_train_val_test_split(
 
 def create_sliding_windows(
     data: xr.Dataset,
-    window_size: int = 2,
+    window_size: int = 6,
     target_offset: int = 1,
     downstream_region: Optional[Tuple[float, float, float, float]] = None,
 ) -> Iterator[Tuple[xr.Dataset, xr.Dataset]]:
     """Create sliding window (input, target) pairs.
     
-    Creates windows where input contains data at time t-12h and t,
-    and target contains precipitation at time t+12h.
+    Creates windows where input contains historical data (default: 3 days = 6 timesteps),
+    and target contains precipitation at the next timestep.
     
     Args:
         data: Dataset with time dimension.
-        window_size: Number of timesteps in input window (default: 2).
+        window_size: Number of timesteps in input window (default: 6 for 3 days).
         target_offset: Offset from last input timestep to target (default: 1).
         downstream_region: Tuple of (lat_min, lat_max, lon_min, lon_max) for downstream region.
                           If provided, targets are cropped to this region.
@@ -578,13 +578,14 @@ class TrainingPipeline:
         self,
         train_end_year: Optional[int] = None,
         val_end_year: Optional[int] = None,
-        train_ratio: float = 0.7,
+        train_ratio: float = 0.85,
         val_ratio: float = 0.15,
         test_start_date: Optional[str] = None,
         seed: int = 42,
         use_prefetch: bool = True,
         prefetch_buffer_size: int = 4,
         resume_from: Optional[str] = None,
+        window_size: int = 6,
     ) -> Tuple[hk.Params, DataNormalizer]:
         """Run full training loop with GPU optimizations.
         
@@ -598,6 +599,7 @@ class TrainingPipeline:
             use_prefetch: Whether to use data prefetching (default: True).
             prefetch_buffer_size: Number of samples to prefetch (default: 4).
             resume_from: Path to checkpoint file to resume training from (optional).
+            window_size: Number of timesteps in input window (default: 6 for 3 days).
             
         Returns:
             Tuple of (trained_params, normalizer).
@@ -622,6 +624,15 @@ class TrainingPipeline:
         normalizer_path = os.path.join(self.output_dir, "normalizer.pkl")
         self.normalizer.save(normalizer_path)
         
+        # Save model and region config for inference
+        config_path = os.path.join(self.output_dir, "model_config.pkl")
+        with open(config_path, 'wb') as f:
+            pickle.dump({
+                'model_config': self.model_config,
+                'region_config': self.region_config,
+            }, f)
+        logger.info(f"Model configuration saved to {config_path}")
+        
         # Normalize data
         train_data_norm = self.normalizer.normalize(train_data)
         val_data_norm = self.normalizer.normalize(val_data)
@@ -639,7 +650,7 @@ class TrainingPipeline:
         )
         
         # Get a sample input for initialization
-        sample_windows = list(create_sliding_windows(train_data_norm, downstream_region=downstream_region))
+        sample_windows = list(create_sliding_windows(train_data_norm, window_size=window_size, downstream_region=downstream_region))
         if not sample_windows:
             raise ValueError("No training windows created - check data size")
         
@@ -709,7 +720,7 @@ class TrainingPipeline:
             epoch_losses = []
             
             # Create data iterator
-            data_iter = create_sliding_windows(train_data_norm, downstream_region=downstream_region)
+            data_iter = create_sliding_windows(train_data_norm, window_size=window_size, downstream_region=downstream_region)
             
             # Optionally wrap with prefetcher
             if use_prefetch:
@@ -810,7 +821,7 @@ class TrainingPipeline:
         
         val_losses = []
         
-        for input_data, target_data in create_sliding_windows(val_data, downstream_region=downstream_region):
+        for input_data, target_data in create_sliding_windows(val_data, window_size=window_size, downstream_region=downstream_region):
             rng, step_rng = jax.random.split(rng)
             
             # Evaluation step

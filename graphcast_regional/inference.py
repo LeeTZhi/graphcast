@@ -81,16 +81,18 @@ class InferencePipeline:
         data: xr.Dataset,
         target_time: pd.Timestamp,
         rng: Optional[jax.random.PRNGKey] = None,
+        window_size: int = 6,
     ) -> xr.Dataset:
         """Generate single-step prediction for target time.
         
-        Loads atmospheric data for time t-12h and t, applies normalization,
-        and generates precipitation prediction for t+12h.
+        Loads atmospheric data for past window_size timesteps (default: 3 days = 6 timesteps),
+        applies normalization, and generates precipitation prediction for next timestep.
         
         Args:
             data: Full dataset containing historical atmospheric data.
-            target_time: Target timestamp for prediction (t+12h).
+            target_time: Target timestamp for prediction.
             rng: Optional random key for stochastic models.
+            window_size: Number of historical timesteps to use (default: 6 for 3 days).
             
         Returns:
             xarray Dataset with precipitation predictions for downstream region.
@@ -103,31 +105,27 @@ class InferencePipeline:
             rng = jax.random.PRNGKey(0)
         
         logger.info(f"Generating prediction for target time: {target_time}")
+        logger.info(f"Using {window_size} historical timesteps (window_size={window_size})")
         
-        # Calculate required input timestamps: t-12h and t
-        # Target time is t+12h, so t = target_time - 12h
+        # Calculate required input timestamps
+        # Target time is t+12h, so we need [t-(window_size-1)*12h, ..., t-12h, t]
         t = target_time - pd.Timedelta(hours=12)
-        t_minus_12h = t - pd.Timedelta(hours=12)
+        input_times = [t - pd.Timedelta(hours=12*i) for i in range(window_size-1, -1, -1)]
         
-        logger.info(f"Input timestamps: {t_minus_12h} and {t}")
+        logger.info(f"Input timestamps: {input_times[0]} to {input_times[-1]}")
         
         # Check if required timestamps exist in data
         available_times = pd.DatetimeIndex(data.time.values)
         
-        if t_minus_12h not in available_times:
-            raise ValueError(
-                f"Required timestamp {t_minus_12h} not found in data. "
-                f"Available times: {available_times[0]} to {available_times[-1]}"
-            )
+        for input_time in input_times:
+            if input_time not in available_times:
+                raise ValueError(
+                    f"Required timestamp {input_time} not found in data. "
+                    f"Available times: {available_times[0]} to {available_times[-1]}"
+                )
         
-        if t not in available_times:
-            raise ValueError(
-                f"Required timestamp {t} not found in data. "
-                f"Available times: {available_times[0]} to {available_times[-1]}"
-            )
-        
-        # Extract input data for the two required timesteps
-        input_data = data.sel(time=[t_minus_12h, t])
+        # Extract input data for the required timesteps
+        input_data = data.sel(time=input_times)
         
         # Apply normalization
         logger.info("Applying normalization to input data")
@@ -163,6 +161,7 @@ class InferencePipeline:
         initial_time: pd.Timestamp,
         num_steps: int,
         rng: Optional[jax.random.PRNGKey] = None,
+        window_size: int = 6,
     ) -> xr.Dataset:
         """Generate multi-step predictions using autoregressive approach.
         
@@ -174,6 +173,7 @@ class InferencePipeline:
             initial_time: Initial timestamp (t) for first prediction.
             num_steps: Number of 12-hour prediction steps to generate.
             rng: Optional random key for stochastic models.
+            window_size: Number of historical timesteps to use (default: 6).
             
         Returns:
             xarray Dataset with precipitation predictions for all timesteps.
@@ -188,6 +188,7 @@ class InferencePipeline:
         logger.info(
             f"Generating {num_steps}-step prediction sequence starting from {initial_time}"
         )
+        logger.info(f"Using window_size={window_size} historical timesteps")
         
         # Initialize list to store predictions
         predictions = []
@@ -208,7 +209,7 @@ class InferencePipeline:
             target_time = current_time + pd.Timedelta(hours=12)
             
             try:
-                prediction = self.predict(working_data, target_time, step_rng)
+                prediction = self.predict(working_data, target_time, step_rng, window_size=window_size)
             except ValueError as e:
                 logger.error(f"Failed to generate prediction at step {step + 1}: {e}")
                 raise

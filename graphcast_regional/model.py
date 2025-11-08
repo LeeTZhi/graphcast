@@ -34,43 +34,48 @@ def prepare_input_features(
     """Prepare input features for all nodes.
     
     Stacks HPA variables across levels and timesteps, plus precipitation,
-    to create a 112-channel feature vector per node.
+    to create feature vector per node. Supports variable number of timesteps.
     
     Args:
-        inputs: xarray Dataset with dimensions (time=2, level=11, lat, lon)
+        inputs: xarray Dataset with dimensions (time=N, level=11, lat, lon)
             containing HPA variables (DPT, GPH, TEM, U, V) and precipitation.
+            Default N=6 for 3 days of history (12-hour intervals).
         upstream_indices: Array of upstream node indices [num_upstream].
         downstream_indices: Array of downstream node indices [num_downstream].
         
     Returns:
-        Array of shape [num_total_nodes, 112] with stacked features.
+        Array of shape [num_total_nodes, num_features] with stacked features.
+        For 6 timesteps: 5 vars × 11 levels × 6 timesteps + 1 var × 6 timesteps = 336 channels
     """
     # Extract dimensions
     num_upstream = len(upstream_indices)
     num_downstream = len(downstream_indices)
     num_total_nodes = num_upstream + num_downstream
     
-    # Stack HPA variables: 5 vars × 11 levels × 2 timesteps = 110 channels
+    # Get number of timesteps dynamically
+    num_timesteps = len(inputs.time)
+    
+    # Stack HPA variables: 5 vars × 11 levels × num_timesteps channels
     hpa_features = []
     for var_name in types.HPA_VARIABLES:
-        var_data = inputs[var_name].values  # Shape: (2, 11, lat, lon)
+        var_data = inputs[var_name].values  # Shape: (num_timesteps, 11, lat, lon)
         # Flatten spatial dimensions
-        var_flat = var_data.reshape(2, 11, -1)  # (2, 11, num_grid_points)
-        # Transpose to (num_grid_points, 2, 11)
+        var_flat = var_data.reshape(num_timesteps, 11, -1)  # (num_timesteps, 11, num_grid_points)
+        # Transpose to (num_grid_points, num_timesteps, 11)
         var_flat = jnp.transpose(var_flat, (2, 0, 1))
-        # Flatten time and level: (num_grid_points, 22)
-        var_flat = var_flat.reshape(-1, 2 * 11)
+        # Flatten time and level: (num_grid_points, num_timesteps * 11)
+        var_flat = var_flat.reshape(-1, num_timesteps * 11)
         hpa_features.append(var_flat)
     
-    # Stack all HPA variables: (num_grid_points, 110)
+    # Stack all HPA variables: (num_grid_points, 5 * num_timesteps * 11)
     hpa_features = jnp.concatenate(hpa_features, axis=-1)
     
-    # Stack precipitation: 1 var × 2 timesteps = 2 channels
-    precip_data = inputs["precipitation"].values  # Shape: (2, lat, lon)
-    precip_flat = precip_data.reshape(2, -1)  # (2, num_grid_points)
-    precip_flat = jnp.transpose(precip_flat, (1, 0))  # (num_grid_points, 2)
+    # Stack precipitation: 1 var × num_timesteps channels
+    precip_data = inputs["precipitation"].values  # Shape: (num_timesteps, lat, lon)
+    precip_flat = precip_data.reshape(num_timesteps, -1)  # (num_timesteps, num_grid_points)
+    precip_flat = jnp.transpose(precip_flat, (1, 0))  # (num_grid_points, num_timesteps)
     
-    # Concatenate HPA and precipitation: (num_grid_points, 112)
+    # Concatenate HPA and precipitation: (num_grid_points, 5*num_timesteps*11 + num_timesteps)
     all_features = jnp.concatenate([hpa_features, precip_flat], axis=-1)
     
     # Extract features for upstream and downstream nodes

@@ -239,6 +239,14 @@ def parse_args():
         help='Stop if no improvement for N validations'
     )
     
+    # Data windowing
+    parser.add_argument(
+        '--window-size',
+        type=int,
+        default=6,
+        help='Number of historical timesteps to use as input (default: 6 for 3 days, 12-hour intervals)'
+    )
+    
     # Data splitting
     parser.add_argument(
         '--train-end-year',
@@ -470,6 +478,7 @@ def main():
             use_prefetch=args.use_prefetch,
             prefetch_buffer_size=args.prefetch_buffer_size,
             resume_from=args.resume_from,
+            window_size=args.window_size,
         )
         logger.info("=" * 80)
         logger.info("")
