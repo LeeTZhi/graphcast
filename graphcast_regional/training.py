@@ -226,9 +226,9 @@ def create_train_val_test_split(
         val_data = data.isel(time=val_mask)
         test_data = data.isel(time=test_mask)
     
-    logger.info(f"Train samples: {len(train_data.time)}")
-    logger.info(f"Val samples: {len(val_data.time)}")
-    logger.info(f"Test samples: {len(test_data.time)}")
+    logger.info(f"Train timesteps: {len(train_data.time)}")
+    logger.info(f"Val timesteps: {len(val_data.time)}")
+    logger.info(f"Test timesteps: {len(test_data.time)}")
     
     # Validate that we have training data
     if len(train_data.time) == 0:
@@ -691,10 +691,17 @@ class TrainingPipeline:
             self.region_config.downstream_lon_max,
         )
         
-        # Get a sample input for initialization
+        # Get a sample input for initialization and count windows
         sample_windows = list(create_sliding_windows(train_data_norm, window_size=window_size, downstream_region=downstream_region))
         if not sample_windows:
             raise ValueError("No training windows created - check data size")
+        
+        # Log actual training window counts
+        num_train_windows = len(sample_windows)
+        num_val_windows = len(list(create_sliding_windows(val_data_norm, window_size=window_size, downstream_region=downstream_region)))
+        logger.info(f"Training windows created: {num_train_windows} (from {len(train_data_norm.time)} timesteps)")
+        logger.info(f"Validation windows created: {num_val_windows} (from {len(val_data_norm.time)} timesteps)")
+        logger.info(f"Window size: {window_size} timesteps (input) + 1 timestep (target)")
         
         sample_input, _ = sample_windows[0]
         
@@ -785,7 +792,7 @@ class TrainingPipeline:
                 
                 # Validation
                 if step % self.training_config.validation_frequency == 0:
-                    val_loss = self._validate(params, val_data_norm, rng)
+                    val_loss = self._validate(params, val_data_norm, rng, window_size)
                     logger.info(
                         f"Step {step}: train_loss={np.mean(epoch_losses[-100:]):.4f}, "
                         f"val_loss={val_loss:.4f}"
@@ -842,6 +849,7 @@ class TrainingPipeline:
         params: hk.Params,
         val_data: xr.Dataset,
         rng: jax.random.PRNGKey,
+        window_size: int = 6,
     ) -> float:
         """Evaluate model on validation set (optimized with JIT).
         
@@ -849,6 +857,7 @@ class TrainingPipeline:
             params: Model parameters.
             val_data: Validation dataset (normalized).
             rng: Random key.
+            window_size: Number of timesteps in input window.
             
         Returns:
             Average validation loss.

@@ -269,14 +269,14 @@ def parse_args():
     parser.add_argument(
         '--train-ratio',
         type=float,
-        default=0.7,
-        help='Fraction of train+val data for training (default: 0.7)'
+        default=0.85,
+        help='Fraction of train+val data for training (default: 0.85)'
     )
     parser.add_argument(
         '--val-ratio',
         type=float,
-        default=0.3,
-        help='Fraction of train+val data for validation (default: 0.3)'
+        default=0.15,
+        help='Fraction of train+val data for validation (default: 0.15)'
     )
     
     # GPU optimization options
