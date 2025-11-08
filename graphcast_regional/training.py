@@ -354,30 +354,61 @@ class DataPrefetcher:
 class WeightedMSELoss:
     """Weighted MSE loss for precipitation prediction.
     
-    Applies higher weights to grid points with precipitation exceeding
-    a threshold to improve prediction of heavy precipitation events.
+    Applies latitude-based weights (proportional to grid cell area) and
+    precipitation-intensity weights to focus on heavy precipitation events.
+    This approach is inspired by GraphCast's loss computation.
     """
     
     def __init__(
         self,
         high_precip_threshold: float = 10.0,
         high_precip_weight: float = 3.0,
+        use_latitude_weights: bool = True,
     ):
         """Initialize WeightedMSELoss.
         
         Args:
             high_precip_threshold: Threshold (mm) for high precipitation.
             high_precip_weight: Weight multiplier for high precipitation samples.
+            use_latitude_weights: Whether to apply latitude-based area weighting.
         """
         self.high_precip_threshold = high_precip_threshold
         self.high_precip_weight = high_precip_weight
+        self.use_latitude_weights = use_latitude_weights
+    
+    def _compute_latitude_weights(self, targets: xr.Dataset) -> jnp.ndarray:
+        """Compute normalized latitude weights proportional to grid cell area.
+        
+        Weights are proportional to cos(latitude), normalized to unit mean.
+        This accounts for the fact that grid cells near the equator cover
+        more area than those near the poles.
+        
+        Args:
+            targets: Target dataset with 'lat' coordinate.
+            
+        Returns:
+            Latitude weights as JAX array with shape matching spatial dimensions.
+        """
+        latitude = targets.coords['lat'].values
+        
+        # Compute weights proportional to cos(latitude)
+        lat_weights = np.cos(np.deg2rad(latitude))
+        
+        # Normalize to unit mean
+        lat_weights = lat_weights / lat_weights.mean()
+        
+        # Convert to JAX array and reshape for broadcasting
+        # Shape: (lat,) -> (lat, 1) for broadcasting over (lat, lon)
+        lat_weights = jnp.array(lat_weights)[:, None]
+        
+        return lat_weights
     
     def __call__(
         self,
         predictions: xr.Dataset,
         targets: xr.Dataset,
     ) -> jnp.ndarray:
-        """Compute weighted MSE loss.
+        """Compute weighted MSE loss with latitude and precipitation weighting.
         
         Args:
             predictions: Predicted precipitation with dimensions (lat, lon).
@@ -393,14 +424,24 @@ class WeightedMSELoss:
         # Compute squared errors
         squared_errors = (pred_precip - target_precip) ** 2
         
-        # Create weights based on target precipitation intensity
-        weights = jnp.where(
+        # Initialize weights to 1.0
+        weights = jnp.ones_like(squared_errors)
+        
+        # Apply latitude-based area weighting
+        if self.use_latitude_weights:
+            lat_weights = self._compute_latitude_weights(targets)
+            weights = weights * lat_weights
+        
+        # Apply precipitation-intensity weighting
+        # Higher weights for grid points with heavy precipitation
+        precip_weights = jnp.where(
             target_precip > self.high_precip_threshold,
             self.high_precip_weight,
             1.0
         )
+        weights = weights * precip_weights
         
-        # Apply weights
+        # Apply weights to squared errors
         weighted_errors = squared_errors * weights
         
         # Compute mean weighted loss
@@ -448,10 +489,11 @@ class TrainingPipeline:
         # Initialize normalizer
         self.normalizer = DataNormalizer()
         
-        # Initialize loss function
+        # Initialize loss function with latitude weighting
         self.loss_fn = WeightedMSELoss(
             high_precip_threshold=training_config.high_precip_threshold,
             high_precip_weight=training_config.high_precip_weight,
+            use_latitude_weights=True,  # Enable area-based weighting
         )
         
         # Initialize model
