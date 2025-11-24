@@ -1,0 +1,93 @@
+# ConvLSTM Configuration: Quick Test (Development/Debugging)
+# This configuration is for rapid testing and debugging
+# Uses minimal resources and trains quickly
+
+# Data Configuration
+data:
+  data_path: "data/regional_weather.nc"
+  output_dir: "checkpoints/quick_test"
+  
+  # Data splitting (temporal ordering preserved)
+  train_ratio: 0.7
+  val_ratio: 0.15
+  # Remaining 0.15 for test set
+  
+  # Window configuration
+  window_size: 4  # Reduced from 6 for faster testing
+  target_offset: 1  # Predict 12 hours ahead
+
+# Region Configuration
+region:
+  # Downstream region (target prediction area)
+  # Smaller region for faster testing
+  downstream:
+    lat_min: 30.0
+    lat_max: 35.0
+    lon_min: 110.0
+    lon_max: 115.0
+  
+  # Upstream region (not used in quick test)
+  include_upstream: false
+
+# Model Architecture
+model:
+  input_channels: 56  # 5 vars × 11 levels + 1 precip
+  hidden_channels: [8, 16]  # Very small model for quick testing
+  kernel_size: 3
+  output_channels: 1  # Precipitation only
+
+# Training Configuration
+training:
+  # Optimization
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 2
+  num_epochs: 5  # Just a few epochs for testing
+  
+  # Gradient management
+  gradient_clip_norm: 1.0
+  gradient_accumulation_steps: 1
+  
+  # Memory optimization
+  use_amp: false  # Disable for easier debugging
+  num_workers: 0  # Single-threaded for debugging
+  pin_memory: false
+  
+  # Scheduler
+  scheduler_type: "none"  # No scheduler for quick test
+
+# Loss Function Configuration
+loss:
+  high_precip_threshold: 10.0  # mm
+  high_precip_weight: 3.0  # Weight multiplier for high precipitation
+  latitude_weighting: true  # Apply cos(latitude) weighting
+
+# Checkpointing and Validation
+checkpointing:
+  checkpoint_frequency: 100  # Save frequently for testing
+  validation_frequency: 50  # Validate frequently
+  early_stopping_patience: 3  # Short patience for quick test
+  save_best_only: true  # Only save best to save space
+
+# Logging
+logging:
+  log_level: "DEBUG"  # Verbose logging for debugging
+  log_to_file: true
+  log_to_console: true
+
+# Device Configuration
+device:
+  device: "auto"  # auto, cuda, cpu
+  cuda_device: 0  # GPU index if multiple GPUs available
+
+# Expected Performance
+# - Peak memory: <1 GB
+# - Training time: ~2-5 minutes per epoch
+# - Total training: ~10-25 minutes for 5 epochs
+#
+# Purpose: This configuration is for:
+# - Testing data loading pipeline
+# - Debugging model architecture
+# - Verifying training loop
+# - Quick sanity checks
+# - NOT for production use or accuracy evaluation

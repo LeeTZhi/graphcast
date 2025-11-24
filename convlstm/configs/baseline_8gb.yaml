@@ -1,0 +1,90 @@
+# ConvLSTM Configuration: Baseline Experiment (8GB GPU)
+# This configuration trains a model using only downstream region data
+# Optimized for 8GB GPU memory with aggressive memory optimization
+
+# Data Configuration
+data:
+  data_path: "data/regional_weather.nc"
+  output_dir: "checkpoints/baseline_8gb"
+  
+  # Data splitting (temporal ordering preserved)
+  train_ratio: 0.7
+  val_ratio: 0.15
+  # Remaining 0.15 for test set
+  
+  # Window configuration
+  window_size: 6  # 3 days at 12-hour intervals
+  target_offset: 1  # Predict 12 hours ahead
+
+# Region Configuration
+region:
+  # Downstream region (target prediction area)
+  downstream:
+    lat_min: 25.0
+    lat_max: 40.0
+    lon_min: 110.0
+    lon_max: 125.0
+  
+  # Upstream region (not used in baseline)
+  include_upstream: false
+
+# Model Architecture
+model:
+  input_channels: 56  # 5 vars × 11 levels + 1 precip
+  hidden_channels: [16, 32]  # Reduced from [32, 64] for memory
+  kernel_size: 3
+  output_channels: 1  # Precipitation only
+
+# Training Configuration
+training:
+  # Optimization
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 2  # Reduced from 4 for memory
+  num_epochs: 100
+  
+  # Gradient management
+  gradient_clip_norm: 1.0
+  gradient_accumulation_steps: 4  # Simulate batch_size=8
+  
+  # Memory optimization
+  use_amp: true  # Mixed precision training (essential)
+  num_workers: 1  # Reduced to save memory
+  pin_memory: true
+  
+  # Scheduler
+  scheduler_type: "cosine"  # cosine, step, or none
+  scheduler_patience: 5  # For ReduceLROnPlateau
+  scheduler_factor: 0.5
+
+# Loss Function Configuration
+loss:
+  high_precip_threshold: 10.0  # mm
+  high_precip_weight: 3.0  # Weight multiplier for high precipitation
+  latitude_weighting: true  # Apply cos(latitude) weighting
+
+# Checkpointing and Validation
+checkpointing:
+  checkpoint_frequency: 2000  # Save less frequently to reduce I/O
+  validation_frequency: 1000  # Validate less frequently
+  early_stopping_patience: 10  # Stop if no improvement for N validations
+  save_best_only: true  # Only save best model to save disk space
+
+# Logging
+logging:
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_to_file: true
+  log_to_console: true
+
+# Device Configuration
+device:
+  device: "auto"  # auto, cuda, cpu
+  cuda_device: 0  # GPU index if multiple GPUs available
+
+# Expected Performance
+# - Peak memory: ~2-3 GB
+# - Training time: ~20-30 minutes per epoch (faster due to smaller model)
+# - Total training: ~35-50 hours for 100 epochs
+# - Effective batch size: 2 × 4 = 8 (via gradient accumulation)
+#
+# Note: Smaller model may have slightly lower accuracy but trains faster

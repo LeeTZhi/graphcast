@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""Training script for ConvLSTM weather prediction model.
+
+This script provides a comprehensive CLI for training ConvLSTM models with
+support for:
+- Configurable model architecture and training hyperparameters
+- Upstream region inclusion for comparative experiments
+- Memory optimization (mixed precision, gradient accumulation)
+- Checkpoint saving and resumption
+- Comprehensive logging
+
+Example usage:
+    # Train baseline model (downstream only)
+    python train_convlstm.py --data data/regional_weather.nc \\
+        --output-dir checkpoints/baseline
+
+    # Train with upstream region
+    python train_convlstm.py --data data/regional_weather.nc \\
+        --output-dir checkpoints/with_upstream \\
+        --include-upstream
+
+    # Resume training from checkpoint
+    python train_convlstm.py --data data/regional_weather.nc \\
+        --output-dir checkpoints/baseline \\
+        --resume checkpoints/baseline/checkpoint_epoch_10.pt
+
+    # Train with custom hyperparameters
+    python train_convlstm.py --data data/regional_weather.nc \\
+        --output-dir checkpoints/custom \\
+        --hidden-channels 64 128 \\
+        --batch-size 8 \\
+        --learning-rate 5e-4 \\
+        --num-epochs 50
+"""
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+from typing import Optional
+
+import torch
+import xarray as xr
+
+from convlstm.model import ConvLSTMUNet
+from convlstm.config import ConvLSTMConfig
+from convlstm.data import (
+    ConvLSTMDataset,
+    ConvLSTMNormalizer,
+    RegionConfig,
+    create_train_val_test_split
+)
+from convlstm.trainer import ConvLSTMTrainer
+
+
+def setup_logging(output_dir: Path, log_level: str = "INFO") -> logging.Logger:
+    """Setup logging configuration.
+    
+    Args:
+        output_dir: Directory to save log file
+        log_level: Logging level (default: INFO)
+        
+    Returns:
+        Configured logger instance
+    """
+    # Create output directory if it doesn't exist
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Configure logging
+    log_file = output_dir / "training.log"
+    
+    # Create logger
+    logger = logging.getLogger("train_convlstm")
+    logger.setLevel(getattr(logging, log_level.upper()))
+    
+    # Remove existing handlers
+    logger.handlers = []
+    
+    # File handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(getattr(logging, log_level.upper()))
+    console_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s'
+    )
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+
+def load_data(data_path: str, logger: logging.Logger) -> xr.Dataset:
+    """Load xarray dataset from file.
+    
+    Args:
+        data_path: Path to NetCDF data file
+        logger: Logger instance
+        
+    Returns:
+        Loaded xarray Dataset
+        
+    Raises:
+        FileNotFoundError: If data file doesn't exist
+        ValueError: If data file is invalid
+    """
+    data_path = Path(data_path)
+    
+    if not data_path.exists():
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+    
+    logger.info(f"Loading data from {data_path}")
+    
+    try:
+        data = xr.open_dataset(data_path)
+        logger.info(f"Data loaded successfully")
+        logger.info(f"Data dimensions: {dict(data.sizes)}")
+        logger.info(f"Data variables: {list(data.data_vars)}")
+        logger.info(f"Time range: {data.time.values[0]} to {data.time.values[-1]}")
+        
+        return data
+    except Exception as e:
+        raise ValueError(f"Failed to load data file: {e}")
+
+
+def parse_args():
+    """Parse command line arguments.
+    
+    Returns:
+        Parsed arguments namespace
+    """
+    parser = argparse.ArgumentParser(
+        description="Train ConvLSTM weather prediction model",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Train baseline model (downstream only)
+  python train_convlstm.py --data data/regional_weather.nc \\
+      --output-dir checkpoints/baseline
+
+  # Train with upstream region
+  python train_convlstm.py --data data/regional_weather.nc \\
+      --output-dir checkpoints/with_upstream \\
+      --include-upstream
+
+  # Resume training from checkpoint
+  python train_convlstm.py --data data/regional_weather.nc \\
+      --output-dir checkpoints/baseline \\
+      --resume checkpoints/baseline/checkpoint_epoch_10.pt
+
+  # Train with custom hyperparameters
+  python train_convlstm.py --data data/regional_weather.nc \\
+      --output-dir checkpoints/custom \\
+      --hidden-channels 64 128 \\
+      --batch-size 8 \\
+      --learning-rate 5e-4 \\
+      --num-epochs 50
+
+  # Memory-optimized training for 12GB GPU
+  python train_convlstm.py --data data/regional_weather.nc \\
+      --output-dir checkpoints/memory_opt \\
+      --batch-size 4 \\
+      --gradient-accumulation-steps 2 \\
+      --use-amp
+        """
+    )
+    
+    # Data arguments
+    data_group = parser.add_argument_group('Data Configuration')
+    data_group.add_argument(
+        '--data',
+        type=str,
+        required=True,
+        help='Path to NetCDF data file'
+    )
+    data_group.add_argument(
+        '--output-dir',
+        type=str,
+        required=True,
+        help='Directory to save checkpoints and logs'
+    )
+    
+    # Region configuration
+    region_group = parser.add_argument_group('Region Configuration')
+    region_group.add_argument(
+        '--include-upstream',
+        action='store_true',
+        help='Include upstream region in input (for comparative experiments)'
+    )
+    region_group.add_argument(
+        '--downstream-lat-min',
+        type=float,
+        default=25.0,
+        help='Downstream region minimum latitude (default: 25.0)'
+    )
+    region_group.add_argument(
+        '--downstream-lat-max',
+        type=float,
+        default=40.0,
+        help='Downstream region maximum latitude (default: 40.0)'
+    )
+    region_group.add_argument(
+        '--downstream-lon-min',
+        type=float,
+        default=110.0,
+        help='Downstream region minimum longitude (default: 110.0)'
+    )
+    region_group.add_argument(
+        '--downstream-lon-max',
+        type=float,
+        default=125.0,
+        help='Downstream region maximum longitude (default: 125.0)'
+    )
+    region_group.add_argument(
+        '--upstream-lat-min',
+        type=float,
+        default=25.0,
+        help='Upstream region minimum latitude (default: 25.0)'
+    )
+    region_group.add_argument(
+        '--upstream-lat-max',
+        type=float,
+        default=50.0,
+        help='Upstream region maximum latitude (default: 50.0)'
+    )
+    region_group.add_argument(
+        '--upstream-lon-min',
+        type=float,
+        default=70.0,
+        help='Upstream region minimum longitude (default: 70.0)'
+    )
+    region_group.add_argument(
+        '--upstream-lon-max',
+        type=float,
+        default=110.0,
+        help='Upstream region maximum longitude (default: 110.0)'
+    )
+    
+    # Model architecture
+    model_group = parser.add_argument_group('Model Architecture')
+    model_group.add_argument(
+        '--hidden-channels',
+        type=int,
+        nargs='+',
+        default=[32, 64],
+        help='Hidden channel dimensions for encoder and bottleneck (default: 32 64)'
+    )
+    model_group.add_argument(
+        '--kernel-size',
+        type=int,
+        default=3,
+        help='Convolutional kernel size (default: 3)'
+    )
+    
+    # Training configuration
+    train_group = parser.add_argument_group('Training Configuration')
+    train_group.add_argument(
+        '--learning-rate',
+        type=float,
+        default=1e-3,
+        help='Initial learning rate (default: 1e-3)'
+    )
+    train_group.add_argument(
+        '--batch-size',
+        type=int,
+        default=4,
+        help='Batch size (default: 4)'
+    )
+    train_group.add_argument(
+        '--num-epochs',
+        type=int,
+        default=100,
+        help='Number of training epochs (default: 100)'
+    )
+    train_group.add_argument(
+        '--gradient-clip-norm',
+        type=float,
+        default=1.0,
+        help='Gradient clipping norm (default: 1.0)'
+    )
+    train_group.add_argument(
+        '--weight-decay',
+        type=float,
+        default=1e-5,
+        help='Weight decay for AdamW optimizer (default: 1e-5)'
+    )
+    
+    # Data configuration
+    data_config_group = parser.add_argument_group('Data Processing')
+    data_config_group.add_argument(
+        '--window-size',
+        type=int,
+        default=6,
+        help='Number of historical timesteps for input (default: 6)'
+    )
+    data_config_group.add_argument(
+        '--target-offset',
+        type=int,
+        default=1,
+        help='Number of timesteps ahead to predict (default: 1)'
+    )
+    data_config_group.add_argument(
+        '--train-ratio',
+        type=float,
+        default=0.7,
+        help='Fraction of data for training (default: 0.7)'
+    )
+    data_config_group.add_argument(
+        '--val-ratio',
+        type=float,
+        default=0.15,
+        help='Fraction of data for validation (default: 0.15)'
+    )
+    
+    # Loss function
+    loss_group = parser.add_argument_group('Loss Function')
+    loss_group.add_argument(
+        '--high-precip-threshold',
+        type=float,
+        default=10.0,
+        help='Precipitation threshold (mm) for high-weight events (default: 10.0)'
+    )
+    loss_group.add_argument(
+        '--high-precip-weight',
+        type=float,
+        default=3.0,
+        help='Weight multiplier for high precipitation events (default: 3.0)'
+    )
+    
+    # Memory optimization
+    memory_group = parser.add_argument_group('Memory Optimization')
+    memory_group.add_argument(
+        '--use-amp',
+        action='store_true',
+        default=True,
+        help='Use automatic mixed precision training (default: True)'
+    )
+    memory_group.add_argument(
+        '--no-amp',
+        action='store_false',
+        dest='use_amp',
+        help='Disable automatic mixed precision training'
+    )
+    memory_group.add_argument(
+        '--gradient-accumulation-steps',
+        type=int,
+        default=1,
+        help='Number of gradient accumulation steps (default: 1)'
+    )
+    memory_group.add_argument(
+        '--num-workers',
+        type=int,
+        default=2,
+        help='Number of DataLoader worker processes (default: 2)'
+    )
+    
+    # Checkpointing
+    checkpoint_group = parser.add_argument_group('Checkpointing')
+    checkpoint_group.add_argument(
+        '--checkpoint-frequency',
+        type=int,
+        default=1000,
+        help='Save checkpoint every N training steps (default: 1000)'
+    )
+    checkpoint_group.add_argument(
+        '--validation-frequency',
+        type=int,
+        default=500,
+        help='Run validation every N training steps (default: 500)'
+    )
+    checkpoint_group.add_argument(
+        '--early-stopping-patience',
+        type=int,
+        default=10,
+        help='Stop training after N epochs without improvement (default: 10)'
+    )
+    checkpoint_group.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        help='Path to checkpoint file to resume training from'
+    )
+    
+    # Logging
+    logging_group = parser.add_argument_group('Logging')
+    logging_group.add_argument(
+        '--log-level',
+        type=str,
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='Logging level (default: INFO)'
+    )
+    
+    # Device
+    device_group = parser.add_argument_group('Device')
+    device_group.add_argument(
+        '--device',
+        type=str,
+        default='auto',
+        choices=['auto', 'cuda', 'mps', 'cpu'],
+        help='Device to use for training (default: auto, mps for Apple Silicon Mac)'
+    )
+    
+    return parser.parse_args()
+
+
+def main():
+    """Main training workflow."""
+    # Parse arguments
+    args = parse_args()
+    
+    # Setup output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Setup logging
+    logger = setup_logging(output_dir, args.log_level)
+    
+    logger.info("=" * 80)
+    logger.info("ConvLSTM Weather Prediction Training")
+    logger.info("=" * 80)
+    
+    # Log configuration
+    logger.info("Configuration:")
+    logger.info(f"  Data: {args.data}")
+    logger.info(f"  Output directory: {output_dir}")
+    logger.info(f"  Include upstream: {args.include_upstream}")
+    logger.info(f"  Hidden channels: {args.hidden_channels}")
+    logger.info(f"  Batch size: {args.batch_size}")
+    logger.info(f"  Learning rate: {args.learning_rate}")
+    logger.info(f"  Number of epochs: {args.num_epochs}")
+    logger.info(f"  Mixed precision: {args.use_amp}")
+    logger.info(f"  Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    
+    # Set device
+    if args.device == 'auto':
+        # Auto-detect best available device
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
+    else:
+        device = torch.device(args.device)
+    
+    logger.info(f"  Device: {device}")
+    
+    if device.type == 'cuda':
+        logger.info(f"  GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"  GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    elif device.type == 'mps':
+        logger.info(f"  Apple Silicon GPU (MPS) detected")
+        logger.info(f"  Note: MPS provides GPU acceleration on Mac")
+    
+    # Load data
+    try:
+        data = load_data(args.data, logger)
+    except Exception as e:
+        logger.error(f"Failed to load data: {e}")
+        sys.exit(1)
+    
+    # Create region configuration
+    region_config = RegionConfig(
+        downstream_lat_min=args.downstream_lat_min,
+        downstream_lat_max=args.downstream_lat_max,
+        downstream_lon_min=args.downstream_lon_min,
+        downstream_lon_max=args.downstream_lon_max,
+        upstream_lat_min=args.upstream_lat_min,
+        upstream_lat_max=args.upstream_lat_max,
+        upstream_lon_min=args.upstream_lon_min,
+        upstream_lon_max=args.upstream_lon_max
+    )
+    
+    logger.info("Region configuration:")
+    logger.info(f"  Downstream: lat=[{region_config.downstream_lat_min}, {region_config.downstream_lat_max}], "
+                f"lon=[{region_config.downstream_lon_min}, {region_config.downstream_lon_max}]")
+    if args.include_upstream:
+        logger.info(f"  Upstream: lat=[{region_config.upstream_lat_min}, {region_config.upstream_lat_max}], "
+                    f"lon=[{region_config.upstream_lon_min}, {region_config.upstream_lon_max}]")
+    
+    # Split data into train/val/test
+    logger.info("Splitting data into train/val/test sets...")
+    try:
+        train_data, val_data, test_data = create_train_val_test_split(
+            data,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio
+        )
+        logger.info(f"Train: {len(train_data.time)} timesteps")
+        logger.info(f"Val: {len(val_data.time)} timesteps")
+        logger.info(f"Test: {len(test_data.time)} timesteps")
+    except Exception as e:
+        logger.error(f"Failed to split data: {e}")
+        sys.exit(1)
+    
+    # Create and fit normalizer
+    logger.info("Computing normalization statistics...")
+    normalizer = ConvLSTMNormalizer()
+    try:
+        normalizer.fit(train_data)
+        
+        # Save normalizer
+        normalizer_path = output_dir / "normalizer.pkl"
+        normalizer.save(str(normalizer_path))
+        logger.info(f"Normalizer saved to {normalizer_path}")
+    except Exception as e:
+        logger.error(f"Failed to fit normalizer: {e}")
+        sys.exit(1)
+    
+    # Normalize data
+    logger.info("Normalizing data...")
+    try:
+        train_data_norm = normalizer.normalize(train_data)
+        val_data_norm = normalizer.normalize(val_data)
+        logger.info("Data normalized successfully")
+    except Exception as e:
+        logger.error(f"Failed to normalize data: {e}")
+        sys.exit(1)
+    
+    # Create datasets
+    logger.info("Creating datasets...")
+    try:
+        train_dataset = ConvLSTMDataset(
+            data=train_data_norm,
+            window_size=args.window_size,
+            region_config=region_config,
+            target_offset=args.target_offset,
+            include_upstream=args.include_upstream
+        )
+        
+        val_dataset = ConvLSTMDataset(
+            data=val_data_norm,
+            window_size=args.window_size,
+            region_config=region_config,
+            target_offset=args.target_offset,
+            include_upstream=args.include_upstream
+        )
+        
+        logger.info(f"Train dataset: {len(train_dataset)} samples")
+        logger.info(f"Val dataset: {len(val_dataset)} samples")
+    except Exception as e:
+        logger.error(f"Failed to create datasets: {e}")
+        sys.exit(1)
+    
+    # Create model configuration
+    config = ConvLSTMConfig(
+        input_channels=56,
+        hidden_channels=args.hidden_channels,
+        kernel_size=args.kernel_size,
+        output_channels=1,
+        learning_rate=args.learning_rate,
+        batch_size=args.batch_size,
+        num_epochs=args.num_epochs,
+        gradient_clip_norm=args.gradient_clip_norm,
+        weight_decay=args.weight_decay,
+        window_size=args.window_size,
+        target_offset=args.target_offset,
+        high_precip_threshold=args.high_precip_threshold,
+        high_precip_weight=args.high_precip_weight,
+        use_amp=args.use_amp,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        num_workers=args.num_workers,
+        checkpoint_frequency=args.checkpoint_frequency,
+        validation_frequency=args.validation_frequency,
+        early_stopping_patience=args.early_stopping_patience
+    )
+    
+    # Validate configuration
+    try:
+        config.validate()
+        logger.info("Configuration validated successfully")
+    except ValueError as e:
+        logger.error(f"Invalid configuration: {e}")
+        sys.exit(1)
+    
+    # Create model
+    logger.info("Creating model...")
+    try:
+        model = ConvLSTMUNet(
+            input_channels=config.input_channels,
+            hidden_channels=config.hidden_channels,
+            output_channels=config.output_channels,
+            kernel_size=config.kernel_size
+        )
+        
+        # Count parameters
+        num_params = sum(p.numel() for p in model.parameters())
+        num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Model created: {num_params:,} parameters ({num_trainable:,} trainable)")
+    except Exception as e:
+        logger.error(f"Failed to create model: {e}")
+        sys.exit(1)
+    
+    # Create trainer
+    logger.info("Creating trainer...")
+    try:
+        trainer = ConvLSTMTrainer(
+            model=model,
+            config=config,
+            region_config=region_config,
+            normalizer=normalizer,
+            device=device,
+            logger=logger
+        )
+    except Exception as e:
+        logger.error(f"Failed to create trainer: {e}")
+        sys.exit(1)
+    
+    # Resume from checkpoint if specified
+    if args.resume is not None:
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        try:
+            trainer.load_checkpoint(Path(args.resume))
+            logger.info("Checkpoint loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            sys.exit(1)
+    
+    # Train model
+    logger.info("Starting training...")
+    logger.info("=" * 80)
+    
+    try:
+        results = trainer.train(
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            checkpoint_dir=output_dir
+        )
+        
+        logger.info("=" * 80)
+        logger.info("Training completed successfully!")
+        logger.info(f"Best validation loss: {results['best_val_loss']:.4f}")
+        logger.info(f"Total training time: {results['total_time']:.2f}s")
+        logger.info(f"Checkpoints saved to: {output_dir}")
+        
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
+        logger.info("Saving checkpoint...")
+        trainer.save_checkpoint(output_dir / "interrupted_checkpoint.pt")
+        logger.info("Checkpoint saved")
+        sys.exit(0)
+        
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        logger.exception("Full traceback:")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
