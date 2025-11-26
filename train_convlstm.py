@@ -42,7 +42,8 @@ from typing import Optional
 import torch
 import xarray as xr
 
-from convlstm.model import ConvLSTMUNet
+from convlstm.model import ConvLSTMUNet, WeightedPrecipitationLoss
+from convlstm.model_deep import DeepConvLSTMUNet
 from convlstm.config import ConvLSTMConfig
 from convlstm.data import (
     ConvLSTMDataset,
@@ -246,11 +247,19 @@ Examples:
     # Model architecture
     model_group = parser.add_argument_group('Model Architecture')
     model_group.add_argument(
+        '--model-type',
+        type=str,
+        default='shallow',
+        choices=['shallow', 'deep'],
+        help='Model architecture type: shallow (2 layers) or deep (4 layers) (default: shallow)'
+    )
+    model_group.add_argument(
         '--hidden-channels',
         type=int,
         nargs='+',
-        default=[32, 64],
-        help='Hidden channel dimensions for encoder and bottleneck (default: 32 64)'
+        default=None,
+        help='Hidden channel dimensions. If not specified, uses default for model type. '
+             'Shallow: [32, 64], Deep: [64, 128, 256, 512]'
     )
     model_group.add_argument(
         '--kernel-size',
@@ -264,8 +273,8 @@ Examples:
     train_group.add_argument(
         '--learning-rate',
         type=float,
-        default=1e-3,
-        help='Initial learning rate (default: 1e-3)'
+        default=1e-4,
+        help='Initial learning rate (default: 1e-4)'
     )
     train_group.add_argument(
         '--batch-size',
@@ -387,6 +396,11 @@ Examples:
         default=None,
         help='Path to checkpoint file to resume training from'
     )
+    checkpoint_group.add_argument(
+        '--reset-lr-on-resume',
+        action='store_true',
+        help='Reset learning rate to command line value when resuming (default: use checkpoint LR)'
+    )
     
     # Logging
     logging_group = parser.add_argument_group('Logging')
@@ -427,10 +441,18 @@ def main():
     logger.info("ConvLSTM Weather Prediction Training")
     logger.info("=" * 80)
     
+    # Set default hidden channels based on model type if not specified
+    if args.hidden_channels is None:
+        if args.model_type == 'shallow':
+            args.hidden_channels = [32, 64]
+        else:  # deep
+            args.hidden_channels = [64, 128, 256, 512]
+    
     # Log configuration
     logger.info("Configuration:")
     logger.info(f"  Data: {args.data}")
     logger.info(f"  Output directory: {output_dir}")
+    logger.info(f"  Model type: {args.model_type}")
     logger.info(f"  Include upstream: {args.include_upstream}")
     logger.info(f"  Hidden channels: {args.hidden_channels}")
     logger.info(f"  Batch size: {args.batch_size}")
@@ -581,20 +603,28 @@ def main():
         logger.error(f"Invalid configuration: {e}")
         sys.exit(1)
     
-    # Create model
+    # Create model based on model type
     logger.info("Creating model...")
     try:
-        model = ConvLSTMUNet(
-            input_channels=config.input_channels,
-            hidden_channels=config.hidden_channels,
-            output_channels=config.output_channels,
-            kernel_size=config.kernel_size
-        )
+        if args.model_type == 'shallow':
+            model = ConvLSTMUNet(
+                input_channels=config.input_channels,
+                hidden_channels=config.hidden_channels,
+                output_channels=config.output_channels,
+                kernel_size=config.kernel_size
+            )
+        else:  # deep
+            model = DeepConvLSTMUNet(
+                input_channels=config.input_channels,
+                hidden_channels=config.hidden_channels,
+                output_channels=config.output_channels,
+                kernel_size=config.kernel_size
+            )
         
         # Count parameters
         num_params = sum(p.numel() for p in model.parameters())
         num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"Model created: {num_params:,} parameters ({num_trainable:,} trainable)")
+        logger.info(f"Model created ({args.model_type}): {num_params:,} parameters ({num_trainable:,} trainable)")
     except Exception as e:
         logger.error(f"Failed to create model: {e}")
         sys.exit(1)
@@ -620,6 +650,18 @@ def main():
         try:
             trainer.load_checkpoint(Path(args.resume))
             logger.info("Checkpoint loaded successfully")
+            
+            # Reset learning rate if requested or if non-default LR specified
+            current_lr = trainer.optimizer.param_groups[0]['lr']
+            should_reset = args.reset_lr_on_resume or (args.learning_rate != 1e-4)
+            
+            if should_reset:
+                logger.info(f"Overriding checkpoint learning rate ({current_lr:.6f}) "
+                           f"with command line value ({args.learning_rate:.6f})")
+                trainer.reset_learning_rate(args.learning_rate)
+            else:
+                logger.info(f"Using checkpoint learning rate: {current_lr:.6f}")
+                
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
             sys.exit(1)

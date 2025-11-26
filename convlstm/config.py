@@ -47,12 +47,12 @@ class ConvLSTMConfig:
     
     # Model architecture
     input_channels: int = 56  # 5 vars × 11 levels + 1 precip
-    hidden_channels: List[int] = field(default_factory=lambda: [32, 64])
+    hidden_channels: List[int] = field(default_factory=lambda: [64, 128])  # Increased from [32, 64]
     kernel_size: int = 3
     output_channels: int = 1
     
     # Training hyperparameters
-    learning_rate: float = 1e-3
+    learning_rate: float = 3e-4  # Reduced from 1e-3 for better stability
     batch_size: int = 4
     num_epochs: int = 100
     gradient_clip_norm: float = 1.0
@@ -62,9 +62,11 @@ class ConvLSTMConfig:
     window_size: int = 6  # 3 days at 12-hour intervals
     target_offset: int = 1  # Predict 12 hours ahead
     
-    # Loss function parameters
-    high_precip_threshold: float = 10.0  # mm
-    high_precip_weight: float = 3.0
+    # Loss function parameters (improved for better extreme value prediction)
+    high_precip_threshold: float = 10.0  # mm - moderate precipitation
+    high_precip_weight: float = 5.0  # Increased from 3.0
+    extreme_precip_threshold: float = 50.0  # mm - extreme precipitation
+    extreme_precip_weight: float = 10.0  # New: higher weight for extreme events
     
     # Memory optimization
     use_amp: bool = True  # Automatic mixed precision
@@ -127,6 +129,20 @@ class ConvLSTMConfig:
         
         if self.high_precip_weight < 1.0:
             raise ValueError(f"high_precip_weight must be >= 1.0, got {self.high_precip_weight}")
+        
+        if hasattr(self, 'extreme_precip_threshold'):
+            if self.extreme_precip_threshold < self.high_precip_threshold:
+                raise ValueError(
+                    f"extreme_precip_threshold ({self.extreme_precip_threshold}) must be >= "
+                    f"high_precip_threshold ({self.high_precip_threshold})"
+                )
+        
+        if hasattr(self, 'extreme_precip_weight'):
+            if self.extreme_precip_weight < self.high_precip_weight:
+                raise ValueError(
+                    f"extreme_precip_weight ({self.extreme_precip_weight}) must be >= "
+                    f"high_precip_weight ({self.high_precip_weight})"
+                )
         
         # Validate memory optimization
         if self.gradient_accumulation_steps <= 0:
