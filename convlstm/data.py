@@ -285,28 +285,34 @@ class ConvLSTMNormalizer:
             return data.rename(rename_dict)
         return data
     
-    def fit(self, train_data: xr.Dataset, use_dask: bool = True, n_workers: int = 4) -> None:
+    def fit(self, train_data: xr.Dataset, use_parallel: bool = True, n_workers: Optional[int] = None) -> None:
         """Compute normalization statistics from training data with optional parallelization.
         
         Computes mean and standard deviation for HPA variables and log-transformed
         precipitation. Statistics are computed across time, lat, and lon dimensions,
         preserving the level dimension for HPA variables.
         
+        Performance tips:
+        - For small datasets (<1000 timesteps): use_parallel=False is faster
+        - For large datasets (>1000 timesteps): use_parallel=True provides speedup
+        - n_workers=None uses all available CPU cores
+        
         Args:
             train_data: Training dataset with dimensions (time, level, lat, lon)
                        for HPA variables and (time, lat, lon) for precipitation.
-            use_dask: If True, use Dask for parallel computation (default: True).
-            n_workers: Number of parallel workers for Dask (default: 4).
+            use_parallel: If True, use parallel computation via NumPy threading (default: True).
+                         Automatically disabled for small datasets.
+            n_workers: Number of parallel workers. If None, uses all available cores.
+                       Only effective when use_parallel=True.
                        
         Raises:
             ValueError: If required variables are missing from train_data.
         """
         import time
+        import os
         start_time = time.time()
         
         logger.info("Computing normalization statistics for ConvLSTM format...")
-        if use_dask:
-            logger.info(f"Using Dask parallelization with {n_workers} workers")
         
         # Rename variables if needed to match expected names
         data_renamed = self._rename_variables(train_data)
@@ -319,47 +325,60 @@ class ConvLSTMNormalizer:
         if "precipitation" not in data_renamed:
             raise ValueError("Missing required variable: precipitation")
         
-        # Create a copy to avoid modifying original data
-        data_for_stats = data_renamed.copy()
+        # Auto-disable parallelization for small datasets (overhead not worth it)
+        n_timesteps = len(data_renamed.time)
+        if use_parallel and n_timesteps < 1000:
+            logger.info(f"Dataset has only {n_timesteps} timesteps, disabling parallelization (overhead > benefit)")
+            use_parallel = False
         
-        # Apply log1p transformation to precipitation before computing statistics
-        # log1p(x) = log(1 + x) handles zero values gracefully
-        data_for_stats["precipitation"] = np.log1p(data_for_stats["precipitation"])
+        # Set number of threads for NumPy operations
+        if use_parallel:
+            if n_workers is None:
+                n_workers = os.cpu_count()
+            
+            # Configure NumPy/OpenBLAS/MKL threading
+            original_num_threads = {}
+            thread_env_vars = [
+                'OMP_NUM_THREADS',
+                'OPENBLAS_NUM_THREADS', 
+                'MKL_NUM_THREADS',
+                'NUMEXPR_NUM_THREADS'
+            ]
+            
+            for var in thread_env_vars:
+                original_num_threads[var] = os.environ.get(var)
+                os.environ[var] = str(n_workers)
+            
+            logger.info(f"Using parallel computation with {n_workers} threads")
+        else:
+            logger.info("Using sequential computation")
         
-        if use_dask:
-            try:
-                import dask
-                import dask.array as da
-                from dask.diagnostics import ProgressBar
-                
-                # Convert to Dask arrays for parallel computation
-                logger.info("Converting to Dask arrays for parallel computation...")
-                
-                # Chunk the data for efficient parallel processing
-                # Chunk along time dimension to parallelize across timesteps
-                chunk_dict = {
-                    'time': min(100, len(data_for_stats.time)),  # Process 100 timesteps at a time
-                    'lat': -1,  # Keep spatial dimensions together
-                    'lon': -1
-                }
-                
-                data_for_stats = data_for_stats.chunk(chunk_dict)
-                
-                # Compute mean and std with Dask
-                logger.info("Computing statistics in parallel...")
-                with ProgressBar():
-                    self.mean = data_for_stats.mean(dim=["time", "lat", "lon"]).compute(num_workers=n_workers)
-                    self.std = data_for_stats.std(dim=["time", "lat", "lon"]).compute(num_workers=n_workers)
-                
-            except ImportError:
-                logger.warning("Dask not available, falling back to sequential computation")
-                use_dask = False
-        
-        if not use_dask:
-            # Sequential computation (original behavior)
-            logger.info("Computing statistics sequentially...")
+        try:
+            # Create a copy to avoid modifying original data
+            data_for_stats = data_renamed.copy()
+            
+            # Apply log1p transformation to precipitation before computing statistics
+            # log1p(x) = log(1 + x) handles zero values gracefully
+            logger.info("Applying log1p transformation to precipitation...")
+            data_for_stats["precipitation"] = np.log1p(data_for_stats["precipitation"])
+            
+            # Compute mean and std for each variable
+            # For HPA variables: compute across (time, lat, lon), preserve level dimension
+            # For precipitation: compute across (time, lat, lon)
+            logger.info("Computing mean and std statistics...")
+            
+            # Use xarray's built-in operations which leverage NumPy's threading
             self.mean = data_for_stats.mean(dim=["time", "lat", "lon"])
             self.std = data_for_stats.std(dim=["time", "lat", "lon"])
+            
+        finally:
+            # Restore original thread settings
+            if use_parallel:
+                for var, original_value in original_num_threads.items():
+                    if original_value is None:
+                        os.environ.pop(var, None)
+                    else:
+                        os.environ[var] = original_value
         
         # Avoid division by zero - replace zero std with 1.0
         for var_name in self.std.data_vars:
