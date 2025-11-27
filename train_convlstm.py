@@ -170,6 +170,13 @@ Examples:
       --batch-size 4 \\
       --gradient-accumulation-steps 2 \\
       --use-amp
+
+  # Train with specific time cutoff for train/val data
+  python train_convlstm.py --data data/regional_weather.nc \\
+      --output-dir checkpoints/time_split \\
+      --trainval-end-date 2020-01-01 \\
+      --train-ratio 0.85 \\
+      --val-ratio 0.15
         """
     )
     
@@ -326,6 +333,21 @@ Examples:
         type=float,
         default=0.15,
         help='Fraction of data for validation (default: 0.15)'
+    )
+    data_config_group.add_argument(
+        '--trainval-end-date',
+        type=str,
+        default=None,
+        help='End date (YYYY-MM-DD) for train/val data. Data before this date is used for '
+             'training and validation, data from this date onwards is used for testing. '
+             'If not specified, uses ratio-based splitting for all data.'
+    )
+    data_config_group.add_argument(
+        '--test-start-date',
+        type=str,
+        default=None,
+        help='Start date (YYYY-MM-DD) for test data. Alternative to trainval-end-date. '
+             'Data before this date is split into train/val using ratios.'
     )
     
     # Loss function
@@ -514,11 +536,22 @@ def main():
         train_data, val_data, test_data = create_train_val_test_split(
             data,
             train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio
+            val_ratio=args.val_ratio,
+            trainval_end_date=args.trainval_end_date,
+            test_start_date=args.test_start_date
         )
         logger.info(f"Train: {len(train_data.time)} timesteps")
         logger.info(f"Val: {len(val_data.time)} timesteps")
         logger.info(f"Test: {len(test_data.time)} timesteps")
+        
+        # Log time ranges for each split
+        if len(train_data.time) > 0:
+            logger.info(f"Train time range: {train_data.time.values[0]} to {train_data.time.values[-1]}")
+        if len(val_data.time) > 0:
+            logger.info(f"Val time range: {val_data.time.values[0]} to {val_data.time.values[-1]}")
+        if len(test_data.time) > 0:
+            logger.info(f"Test time range: {test_data.time.values[0]} to {test_data.time.values[-1]}")
+            
     except Exception as e:
         logger.error(f"Failed to split data: {e}")
         sys.exit(1)

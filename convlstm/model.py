@@ -269,8 +269,10 @@ class ConvLSTMUNet(nn.Module):
         # Output head: Map to precipitation
         output = self.output_head(h_dec)
         
-        # Apply ReLU for non-negative precipitation
-        output = self.relu(output)
+        # NOTE: Do NOT apply ReLU here when working with normalized data
+        # The target values are normalized (log1p + Z-score), which can be negative
+        # ReLU will be applied during denormalization if needed
+        # output = self.relu(output)
         
         return output
 
@@ -282,7 +284,9 @@ class WeightedPrecipitationLoss(nn.Module):
     This loss function applies two types of weighting to focus the model on
     important predictions:
     1. Precipitation-based weighting: Higher weights for grid points with
-       precipitation above a threshold (to focus on high precipitation events)
+       precipitation above thresholds (to focus on high precipitation events)
+       - Moderate precipitation (>10mm): medium weight
+       - Heavy precipitation (>50mm): high weight
     2. Latitude-based weighting: Weights proportional to cos(latitude) to
        account for grid cell area variation (cells are smaller near poles)
     
@@ -292,19 +296,25 @@ class WeightedPrecipitationLoss(nn.Module):
     Attributes:
         high_precip_threshold: Precipitation threshold (mm) for high-weight events
         high_precip_weight: Weight multiplier for high precipitation events
+        extreme_precip_threshold: Precipitation threshold (mm) for extreme events
+        extreme_precip_weight: Weight multiplier for extreme precipitation events
         latitude_coords: Latitude values for computing area-based weights
         latitude_weights: Pre-computed latitude weights (cos(latitude))
     """
     
     def __init__(self, 
                  high_precip_threshold: float = 10.0,
-                 high_precip_weight: float = 3.0,
+                 high_precip_weight: float = 5.0,
+                 extreme_precip_threshold: float = 50.0,
+                 extreme_precip_weight: float = 10.0,
                  latitude_coords: Optional[np.ndarray] = None):
         """Initialize WeightedPrecipitationLoss.
         
         Args:
             high_precip_threshold: Threshold (mm) for high precipitation (default: 10.0)
-            high_precip_weight: Weight multiplier for high precipitation (default: 3.0)
+            high_precip_weight: Weight multiplier for high precipitation (default: 5.0, increased from 3.0)
+            extreme_precip_threshold: Threshold (mm) for extreme precipitation (default: 50.0)
+            extreme_precip_weight: Weight multiplier for extreme precipitation (default: 10.0)
             latitude_coords: Array of latitude values in degrees (default: None)
                 If None, latitude weighting is disabled
         """
@@ -316,8 +326,22 @@ class WeightedPrecipitationLoss(nn.Module):
         if high_precip_weight < 1.0:
             raise ValueError(f"high_precip_weight must be >= 1.0, got {high_precip_weight}")
         
+        if extreme_precip_threshold < high_precip_threshold:
+            raise ValueError(
+                f"extreme_precip_threshold ({extreme_precip_threshold}) must be >= "
+                f"high_precip_threshold ({high_precip_threshold})"
+            )
+        
+        if extreme_precip_weight < high_precip_weight:
+            raise ValueError(
+                f"extreme_precip_weight ({extreme_precip_weight}) must be >= "
+                f"high_precip_weight ({high_precip_weight})"
+            )
+        
         self.high_precip_threshold = high_precip_threshold
         self.high_precip_weight = high_precip_weight
+        self.extreme_precip_threshold = extreme_precip_threshold
+        self.extreme_precip_weight = extreme_precip_weight
         
         # Pre-compute latitude weights if coordinates provided
         if latitude_coords is not None:
@@ -366,10 +390,14 @@ class WeightedPrecipitationLoss(nn.Module):
         # Initialize weights as ones
         weights = torch.ones_like(targets)
         
-        # Apply precipitation-based weighting
-        # High precipitation events get higher weights
-        high_precip_mask = targets > self.high_precip_threshold
+        # Apply precipitation-based weighting with multiple thresholds
+        # High precipitation events (10-50mm) get higher weights
+        high_precip_mask = (targets > self.high_precip_threshold) & (targets <= self.extreme_precip_threshold)
         weights[high_precip_mask] = self.high_precip_weight
+        
+        # Extreme precipitation events (>50mm) get even higher weights
+        extreme_precip_mask = targets > self.extreme_precip_threshold
+        weights[extreme_precip_mask] = self.extreme_precip_weight
         
         # Apply latitude-based weighting if available
         if self.latitude_weights is not None:

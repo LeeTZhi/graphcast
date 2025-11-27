@@ -327,8 +327,9 @@ class ConvLSTMTrainer:
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode='min',
-            factor=0.5,
-            patience=5,
+            factor=0.7,      # 改为0.7，每次衰减到原来的70%（更温和）
+            patience=10,     # 改为10，需要10个epoch没有改善才衰减（更宽容）
+            min_lr=1e-6,     # 添加最小学习率限制
             verbose=True
         )
         
@@ -345,6 +346,8 @@ class ConvLSTMTrainer:
         self.loss_fn = WeightedPrecipitationLoss(
             high_precip_threshold=config.high_precip_threshold,
             high_precip_weight=config.high_precip_weight,
+            extreme_precip_threshold=getattr(config, 'extreme_precip_threshold', 50.0),
+            extreme_precip_weight=getattr(config, 'extreme_precip_weight', 10.0),
             latitude_coords=lat_coords
         ).to(self.device)
         
@@ -471,6 +474,22 @@ class ConvLSTMTrainer:
                     f"Step {self.global_step}: train_loss={loss:.4f}, val_loss={val_loss:.4f}"
                 )
                 self.model.train()  # Switch back to training mode
+        
+        # Handle remaining gradients if batch count is not divisible by accumulation steps
+        if num_batches % self.config.gradient_accumulation_steps != 0:
+            # Gradient clipping
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.gradient_clip_norm
+            )
+            
+            # Optimizer step
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad()
+            
+            self.global_step += 1
         
         avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
         
@@ -763,7 +782,7 @@ class ConvLSTMTrainer:
         else:
             self.logger.warning("Checkpoint does not contain scheduler state")
         
-        # Load scaler state (for mixed precision training)
+        # Load scaler state
         if 'scaler_state_dict' in checkpoint:
             try:
                 self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -773,21 +792,36 @@ class ConvLSTMTrainer:
         else:
             self.logger.warning("Checkpoint does not contain scaler state")
         
-        # Load training progress
+        # Restore training state
         self.current_epoch = checkpoint.get('epoch', 0)
         self.global_step = checkpoint.get('global_step', 0)
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        self.epochs_without_improvement = 0  # Reset early stopping counter
         
         self.logger.info(
             f"Training state restored: epoch={self.current_epoch}, "
             f"step={self.global_step}, best_val_loss={self.best_val_loss:.4f}"
         )
         
-        # Log configuration info if available
+        # Log checkpoint configuration for reference
         if 'config' in checkpoint:
             self.logger.info(f"Checkpoint config: {checkpoint['config']}")
-        
         if 'region_config' in checkpoint:
             self.logger.info(f"Checkpoint region config: {checkpoint['region_config']}")
+    
+    def reset_learning_rate(self, new_lr: float):
+        """Reset learning rate to a new value.
+        
+        Useful when resuming training from a checkpoint with a different
+        learning rate than what was saved.
+        
+        Args:
+            new_lr: New learning rate to set
+        """
+        old_lr = self.optimizer.param_groups[0]['lr']
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+        
+        self.logger.info(f"Learning rate reset: {old_lr:.6f} -> {new_lr:.6f}")
         
         self.logger.info("Checkpoint loaded successfully")

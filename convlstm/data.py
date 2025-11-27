@@ -75,6 +75,7 @@ def create_train_val_test_split(
     train_ratio: float = 0.85,
     val_ratio: float = 0.15,
     test_start_date: Optional[str] = None,
+    trainval_end_date: Optional[str] = None,
 ) -> Tuple[xr.Dataset, xr.Dataset, xr.Dataset]:
     """Split data by time ranges into train/val/test sets.
     
@@ -90,6 +91,9 @@ def create_train_val_test_split(
         val_ratio: Fraction of data for validation (if years not specified).
         test_start_date: Date string (YYYY-MM-DD) when test set starts. If specified,
                         data before this date is split into train/val using ratios.
+        trainval_end_date: Date string (YYYY-MM-DD) when train/val data ends. If specified,
+                          only data before this date is used for training and validation,
+                          and data from this date onwards is used for testing.
         
     Returns:
         Tuple of (train_data, val_data, test_data).
@@ -112,6 +116,11 @@ def create_train_val_test_split(
         >>> train, val, test = create_train_val_test_split(
         ...     data, test_start_date='2020-01-01', train_ratio=0.85, val_ratio=0.15
         ... )
+        
+        >>> # Use only data before specified date for train/val
+        >>> train, val, test = create_train_val_test_split(
+        ...     data, trainval_end_date='2020-01-01', train_ratio=0.85, val_ratio=0.15
+        ... )
     """
     logger.info("Splitting data into train/val/test sets...")
     
@@ -129,8 +138,31 @@ def create_train_val_test_split(
             "Temporal ordering must be preserved for time series prediction."
         )
     
+    # If trainval_end_date is specified, use it to split train/val from test
+    if trainval_end_date is not None:
+        logger.info(f"Using trainval_end_date: train/val data before {trainval_end_date}, test data from {trainval_end_date} onwards")
+        
+        trainval_cutoff = np.datetime64(trainval_end_date)
+        
+        # Split into train+val and test
+        trainval_mask = times < trainval_cutoff
+        test_mask = times >= trainval_cutoff
+        
+        trainval_data = data.isel(time=trainval_mask)
+        test_data = data.isel(time=test_mask)
+        
+        # Further split train+val using ratios
+        n_trainval = len(trainval_data.time)
+        n_train = int(n_trainval * train_ratio / (train_ratio + val_ratio))
+        
+        train_data = trainval_data.isel(time=slice(0, n_train))
+        val_data = trainval_data.isel(time=slice(n_train, None))
+        
+        logger.info(f"Train+Val cutoff: {trainval_cutoff}")
+        logger.info(f"Train/Val split ratio: {train_ratio}:{val_ratio}")
+        
     # If test_start_date is specified, use date-based splitting
-    if test_start_date is not None:
+    elif test_start_date is not None:
         logger.info(f"Using date-based split: test starts at {test_start_date}")
         
         test_cutoff = np.datetime64(test_start_date)

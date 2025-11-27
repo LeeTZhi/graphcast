@@ -13,7 +13,7 @@ from pathlib import Path
 
 # Physical bounds for weather variables (reasonable ranges)
 PHYSICAL_BOUNDS = {
-    'precipitation': (0.0, 500.0),  # mm (0 to 500mm is extreme but possible)
+    'precipitation': (0.0, 1000.0),  # mm (0 to 500mm is extreme but possible)
     'dew_point': (180.0, 330.0),  # K (-93°C to 57°C)
     'geopotential_height': (-1000.0, 35000.0),  # m (Dead Sea to stratosphere)
     'temperature': (180.0, 330.0),  # K (-93°C to 57°C)
