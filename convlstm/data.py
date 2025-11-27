@@ -332,12 +332,12 @@ class ConvLSTMNormalizer:
             use_parallel = False
         
         # Set number of threads for NumPy operations
+        original_num_threads = {}
         if use_parallel:
             if n_workers is None:
                 n_workers = os.cpu_count()
             
             # Configure NumPy/OpenBLAS/MKL threading
-            original_num_threads = {}
             thread_env_vars = [
                 'OMP_NUM_THREADS',
                 'OPENBLAS_NUM_THREADS', 
@@ -353,23 +353,34 @@ class ConvLSTMNormalizer:
         else:
             logger.info("Using sequential computation")
         
+        # Load data into memory if it's lazy-loaded (from NetCDF)
+        # This prevents repeated disk I/O during statistics computation
+        if hasattr(data_renamed, 'chunks') and data_renamed.chunks:
+            logger.info("Loading data into memory (this may take a moment)...")
+            data_renamed = data_renamed.load()
+            logger.info("✓ Data loaded into memory")
+        
         try:
-            # Create a copy to avoid modifying original data
-            data_for_stats = data_renamed.copy()
+            # Compute statistics for HPA variables directly (no transformation needed)
+            logger.info("Computing statistics for HPA variables...")
+            mean_dict = {}
+            std_dict = {}
             
-            # Apply log1p transformation to precipitation before computing statistics
+            for var in HPA_VARIABLES:
+                logger.info(f"  Processing {var}...")
+                mean_dict[var] = data_renamed[var].mean(dim=["time", "lat", "lon"])
+                std_dict[var] = data_renamed[var].std(dim=["time", "lat", "lon"])
+            
+            # For precipitation: apply log1p transformation before computing statistics
             # log1p(x) = log(1 + x) handles zero values gracefully
-            logger.info("Applying log1p transformation to precipitation...")
-            data_for_stats["precipitation"] = np.log1p(data_for_stats["precipitation"])
+            logger.info("  Processing precipitation (with log1p transform)...")
+            precip_log = np.log1p(data_renamed["precipitation"])
+            mean_dict["precipitation"] = precip_log.mean(dim=["time", "lat", "lon"])
+            std_dict["precipitation"] = precip_log.std(dim=["time", "lat", "lon"])
             
-            # Compute mean and std for each variable
-            # For HPA variables: compute across (time, lat, lon), preserve level dimension
-            # For precipitation: compute across (time, lat, lon)
-            logger.info("Computing mean and std statistics...")
-            
-            # Use xarray's built-in operations which leverage NumPy's threading
-            self.mean = data_for_stats.mean(dim=["time", "lat", "lon"])
-            self.std = data_for_stats.std(dim=["time", "lat", "lon"])
+            # Combine into xarray Datasets
+            self.mean = xr.Dataset(mean_dict)
+            self.std = xr.Dataset(std_dict)
             
         finally:
             # Restore original thread settings
