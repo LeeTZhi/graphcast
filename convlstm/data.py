@@ -76,17 +76,18 @@ def create_train_val_test_split(
     val_ratio: float = 0.15,
     test_start_date: Optional[str] = None,
     trainval_end_date: Optional[str] = None,
-    random_trainval_split: bool = True,
+    random_trainval_split: bool = False,
     random_seed: int = 42,
 ) -> Tuple[xr.Dataset, xr.Dataset, xr.Dataset]:
     """Split data into train/val/test sets with flexible splitting strategies.
     
     This function supports two splitting strategies:
-    1. Random split for train/val (when random_trainval_split=True):
+    1. Sequential split (when random_trainval_split=False, DEFAULT):
+       - All splits maintain temporal ordering
+       - Best for time series prediction (avoids data leakage)
+    2. Random split for train/val (when random_trainval_split=True):
        - Test set is split by time (temporal cutoff)
        - Train/val are randomly sampled from remaining data
-    2. Sequential split (when random_trainval_split=False):
-       - All splits maintain temporal ordering (original behavior)
     
     Args:
         data: Full dataset with time dimension.
@@ -100,7 +101,7 @@ def create_train_val_test_split(
                           only data before this date is used for training and validation,
                           and data from this date onwards is used for testing.
         random_trainval_split: If True, randomly split train/val while keeping test temporal.
-                              If False, use sequential temporal splitting (default: True).
+                              If False, use sequential temporal splitting (default: False).
         random_seed: Random seed for reproducible train/val splitting (default: 42).
         
     Returns:
@@ -110,14 +111,14 @@ def create_train_val_test_split(
         ValueError: If no training data is found or if temporal ordering is violated.
         
     Examples:
+        >>> # Sequential temporal splitting (DEFAULT, recommended for time series)
+        >>> train, val, test = create_train_val_test_split(
+        ...     data, test_start_date='2020-01-01'
+        ... )
+        
         >>> # Random train/val split with temporal test split
         >>> train, val, test = create_train_val_test_split(
         ...     data, test_start_date='2020-01-01', random_trainval_split=True
-        ... )
-        
-        >>> # Sequential temporal splitting (original behavior)
-        >>> train, val, test = create_train_val_test_split(
-        ...     data, test_start_date='2020-01-01', random_trainval_split=False
         ... )
     """
     logger.info("Splitting data into train/val/test sets...")
@@ -286,11 +287,16 @@ class ConvLSTMNormalizer:
         return data
     
     def fit(self, train_data: xr.Dataset) -> None:
-        """Compute normalization statistics efficiently."""
+        """Compute normalization statistics efficiently using chunked computation.
+        
+        For large datasets (>10GB), this method uses Dask's chunked computation
+        to avoid loading all data into memory at once. Statistics are computed
+        in a streaming fashion with minimal memory footprint.
+        """
         import time
         start_time = time.time()
         
-        logger.info("Computing normalization statistics (Optimized)...")
+        logger.info("Computing normalization statistics (Chunked)...")
         
         # 1. 变量重命名
         data = self._rename_variables(train_data)
@@ -302,43 +308,58 @@ class ConvLSTMNormalizer:
         if "precipitation" not in data:
             raise ValueError("Missing precipitation variable")
 
-        # =======================================================
-        # 优化点 1: 内存加载 (如果内存足够)
-        # 如果你的内存 > 数据集大小，取消下面这行的注释，速度会提升 10-100 倍
-        data = data.load() 
-        # =======================================================
+        # 3. 检查数据大小，决定是否加载到内存
+        total_bytes = sum(data[var].nbytes for var in data.data_vars)
+        total_gb = total_bytes / 1e9
+        logger.info(f"Dataset size: {total_gb:.2f} GB")
+        
+        # 如果数据 < 10GB，直接加载到内存（速度最快）
+        # 否则使用 Dask 分块计算（节省内存）
+        if total_gb < 10.0:
+            logger.info("Loading data into memory for fast computation...")
+            data = data.load()
+        else:
+            logger.info("Using chunked computation to save memory...")
+            # 优化 chunk 大小：时间维度不分块，空间维度分块
+            data = data.chunk({'time': -1, 'lat': 50, 'lon': 50})
 
-        # 3. 处理 HPA 变量 (批量计算)
-        # HPA 变量都有 (time, level, lat, lon) 维度，可以一次性计算
-        logger.info("Computing HPA stats in batch...")
+        # 4. 处理 HPA 变量 (批量计算)
+        logger.info("Computing HPA stats (5 variables × 11 levels)...")
         
         # 选取所有 HPA 变量组成子集
         hpa_subset = data[HPA_VARIABLES]
         
         # 一次性计算所有 HPA 变量的 Mean 和 Std
-        # Xarray/Dask 会尝试合并 IO 操作
+        # 使用 persist() 可以让 Dask 缓存中间结果，避免重复计算
+        if total_gb >= 10.0:
+            hpa_subset = hpa_subset.persist()
+        
         self.mean = hpa_subset.mean(dim=["time", "lat", "lon"]).compute()
         self.std = hpa_subset.std(dim=["time", "lat", "lon"]).compute()
+        
+        logger.info(f"  ✓ HPA stats computed")
 
-        # 4. 处理降水 (Precipitation)
-        # 需要单独处理，因为它需要 log1p 变换，且没有 level 维度
-        logger.info("Computing precipitation stats...")
+        # 5. 处理降水 (Precipitation)
+        logger.info("Computing precipitation stats (with log1p transform)...")
         
         # 使用 log1p 变换
-        # 注意：这里尽量使用 map_blocks 或者直接操作，避免过早触发计算
         precip_log = np.log1p(data["precipitation"])
+        
+        # 如果使用分块计算，persist 可以避免重复计算 log1p
+        if total_gb >= 10.0:
+            precip_log = precip_log.persist()
         
         precip_mean = precip_log.mean(dim=["time", "lat", "lon"]).compute()
         precip_std = precip_log.std(dim=["time", "lat", "lon"]).compute()
         
-        # 5. 合并结果
+        logger.info(f"  ✓ Precipitation stats computed")
+        
+        # 6. 合并结果
         self.mean["precipitation"] = precip_mean
         self.std["precipitation"] = precip_std
         
-        # 6. 处理标准差为 0 的情况 (防止除零错误)
-        # 使用 where 替换，比循环快且简洁
+        # 7. 处理标准差为 0 的情况 (防止除零错误)
         for var_name in self.std.data_vars:
-            # 只有当确实存在 0 时才替换，减少操作
             if (self.std[var_name] == 0).any():
                 self.std[var_name] = xr.where(self.std[var_name] == 0, 1.0, self.std[var_name])
                 logger.warning(f"Replaced 0 std with 1.0 for {var_name}")

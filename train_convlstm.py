@@ -556,19 +556,36 @@ def main():
         logger.error(f"Failed to split data: {e}")
         sys.exit(1)
     
-    # Create and fit normalizer
-    logger.info("Computing normalization statistics...")
+    # Create and fit normalizer (with caching)
+    normalizer_path = output_dir / "normalizer.pkl"
     normalizer = ConvLSTMNormalizer()
-    try:
-        normalizer.fit(train_data)
-        
-        # Save normalizer
-        normalizer_path = output_dir / "normalizer.pkl"
-        normalizer.save(str(normalizer_path))
-        logger.info(f"Normalizer saved to {normalizer_path}")
-    except Exception as e:
-        logger.error(f"Failed to fit normalizer: {e}")
-        sys.exit(1)
+    
+    # Check if normalizer already exists (from previous run)
+    if normalizer_path.exists() and args.resume is None:
+        logger.info(f"Found existing normalizer at {normalizer_path}")
+        logger.info("Loading cached normalization statistics...")
+        try:
+            normalizer.load(str(normalizer_path))
+            logger.info("Normalizer loaded successfully (skipped recomputation)")
+        except Exception as e:
+            logger.warning(f"Failed to load cached normalizer: {e}")
+            logger.info("Computing normalization statistics from scratch...")
+            try:
+                normalizer.fit(train_data)
+                normalizer.save(str(normalizer_path))
+                logger.info(f"Normalizer saved to {normalizer_path}")
+            except Exception as e:
+                logger.error(f"Failed to fit normalizer: {e}")
+                sys.exit(1)
+    else:
+        logger.info("Computing normalization statistics...")
+        try:
+            normalizer.fit(train_data)
+            normalizer.save(str(normalizer_path))
+            logger.info(f"Normalizer saved to {normalizer_path}")
+        except Exception as e:
+            logger.error(f"Failed to fit normalizer: {e}")
+            sys.exit(1)
     
     # Normalize data
     logger.info("Normalizing data...")
