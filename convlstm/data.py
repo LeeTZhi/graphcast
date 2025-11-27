@@ -285,34 +285,24 @@ class ConvLSTMNormalizer:
             return data.rename(rename_dict)
         return data
     
-    def fit(self, train_data: xr.Dataset, use_parallel: bool = True, n_workers: Optional[int] = None) -> None:
-        """Compute normalization statistics from training data with optional parallelization.
+    def fit(self, train_data: xr.Dataset) -> None:
+        """Compute normalization statistics from training data.
         
         Computes mean and standard deviation for HPA variables and log-transformed
         precipitation. Statistics are computed across time, lat, and lon dimensions,
         preserving the level dimension for HPA variables.
         
-        Performance tips:
-        - For small datasets (<1000 timesteps): use_parallel=False is faster
-        - For large datasets (>1000 timesteps): use_parallel=True provides speedup
-        - n_workers=None uses all available CPU cores
-        
         Args:
             train_data: Training dataset with dimensions (time, level, lat, lon)
                        for HPA variables and (time, lat, lon) for precipitation.
-            use_parallel: If True, use parallel computation via NumPy threading (default: True).
-                         Automatically disabled for small datasets.
-            n_workers: Number of parallel workers. If None, uses all available cores.
-                       Only effective when use_parallel=True.
                        
         Raises:
             ValueError: If required variables are missing from train_data.
         """
         import time
-        import os
         start_time = time.time()
         
-        logger.info("Computing normalization statistics for ConvLSTM format...")
+        logger.info("Computing normalization statistics...")
         
         # Rename variables if needed to match expected names
         data_renamed = self._rename_variables(train_data)
@@ -325,71 +315,25 @@ class ConvLSTMNormalizer:
         if "precipitation" not in data_renamed:
             raise ValueError("Missing required variable: precipitation")
         
-        # Auto-disable parallelization for small datasets (overhead not worth it)
-        n_timesteps = len(data_renamed.time)
-        if use_parallel and n_timesteps < 1000:
-            logger.info(f"Dataset has only {n_timesteps} timesteps, disabling parallelization (overhead > benefit)")
-            use_parallel = False
+        # Compute statistics for HPA variables directly (no transformation needed)
+        mean_dict = {}
+        std_dict = {}
         
-        # Set number of threads for NumPy operations
-        original_num_threads = {}
-        if use_parallel:
-            if n_workers is None:
-                n_workers = os.cpu_count()
-            
-            # Configure NumPy/OpenBLAS/MKL threading
-            thread_env_vars = [
-                'OMP_NUM_THREADS',
-                'OPENBLAS_NUM_THREADS', 
-                'MKL_NUM_THREADS',
-                'NUMEXPR_NUM_THREADS'
-            ]
-            
-            for var in thread_env_vars:
-                original_num_threads[var] = os.environ.get(var)
-                os.environ[var] = str(n_workers)
-            
-            logger.info(f"Using parallel computation with {n_workers} threads")
-        else:
-            logger.info("Using sequential computation")
+        for var in HPA_VARIABLES:
+            logger.info(f"  Computing stats for {var}...")
+            mean_dict[var] = data_renamed[var].mean(dim=["time", "lat", "lon"])
+            std_dict[var] = data_renamed[var].std(dim=["time", "lat", "lon"])
         
-        # Load data into memory if it's lazy-loaded (from NetCDF)
-        # This prevents repeated disk I/O during statistics computation
-        if hasattr(data_renamed, 'chunks') and data_renamed.chunks:
-            logger.info("Loading data into memory (this may take a moment)...")
-            data_renamed = data_renamed.load()
-            logger.info("✓ Data loaded into memory")
+        # For precipitation: apply log1p transformation before computing statistics
+        # log1p(x) = log(1 + x) handles zero values gracefully
+        logger.info("  Computing stats for precipitation (with log1p transform)...")
+        precip_log = np.log1p(data_renamed["precipitation"])
+        mean_dict["precipitation"] = precip_log.mean(dim=["time", "lat", "lon"])
+        std_dict["precipitation"] = precip_log.std(dim=["time", "lat", "lon"])
         
-        try:
-            # Compute statistics for HPA variables directly (no transformation needed)
-            logger.info("Computing statistics for HPA variables...")
-            mean_dict = {}
-            std_dict = {}
-            
-            for var in HPA_VARIABLES:
-                logger.info(f"  Processing {var}...")
-                mean_dict[var] = data_renamed[var].mean(dim=["time", "lat", "lon"])
-                std_dict[var] = data_renamed[var].std(dim=["time", "lat", "lon"])
-            
-            # For precipitation: apply log1p transformation before computing statistics
-            # log1p(x) = log(1 + x) handles zero values gracefully
-            logger.info("  Processing precipitation (with log1p transform)...")
-            precip_log = np.log1p(data_renamed["precipitation"])
-            mean_dict["precipitation"] = precip_log.mean(dim=["time", "lat", "lon"])
-            std_dict["precipitation"] = precip_log.std(dim=["time", "lat", "lon"])
-            
-            # Combine into xarray Datasets
-            self.mean = xr.Dataset(mean_dict)
-            self.std = xr.Dataset(std_dict)
-            
-        finally:
-            # Restore original thread settings
-            if use_parallel:
-                for var, original_value in original_num_threads.items():
-                    if original_value is None:
-                        os.environ.pop(var, None)
-                    else:
-                        os.environ[var] = original_value
+        # Combine into xarray Datasets
+        self.mean = xr.Dataset(mean_dict)
+        self.std = xr.Dataset(std_dict)
         
         # Avoid division by zero - replace zero std with 1.0
         for var_name in self.std.data_vars:
@@ -407,9 +351,9 @@ class ConvLSTMNormalizer:
         self._is_fitted = True
         
         elapsed_time = time.time() - start_time
-        logger.info(f"Normalization statistics computed successfully in {elapsed_time:.2f} seconds")
-        logger.info(f"Variables: {list(self.mean.data_vars)}")
-        logger.info(f"Precipitation statistics (log-transformed): "
+        logger.info(f"✓ Normalization completed in {elapsed_time:.2f} seconds")
+        logger.info(f"  Variables: {list(self.mean.data_vars)}")
+        logger.info(f"  Precipitation stats (log-transformed): "
                    f"mean={float(self.mean['precipitation'].values):.4f}, "
                    f"std={float(self.std['precipitation'].values):.4f}")
     
