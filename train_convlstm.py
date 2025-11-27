@@ -275,6 +275,39 @@ Examples:
         help='Convolutional kernel size (default: 3)'
     )
     
+    # Regularization
+    regularization_group = parser.add_argument_group('Regularization (for Deep model)')
+    regularization_group.add_argument(
+        '--dropout-rate',
+        type=float,
+        default=0.2,
+        help='Dropout rate for regularization (default: 0.2, set to 0 to disable)'
+    )
+    regularization_group.add_argument(
+        '--use-batch-norm',
+        action='store_true',
+        default=True,
+        help='Use batch normalization (default: True)'
+    )
+    regularization_group.add_argument(
+        '--no-batch-norm',
+        action='store_false',
+        dest='use_batch_norm',
+        help='Disable batch normalization'
+    )
+    regularization_group.add_argument(
+        '--use-spatial-dropout',
+        action='store_true',
+        default=True,
+        help='Use spatial dropout (default: True)'
+    )
+    regularization_group.add_argument(
+        '--no-spatial-dropout',
+        action='store_false',
+        dest='use_spatial_dropout',
+        help='Use regular dropout instead of spatial dropout'
+    )
+    
     # Training configuration
     train_group = parser.add_argument_group('Training Configuration')
     train_group.add_argument(
@@ -668,8 +701,14 @@ def main():
                 input_channels=config.input_channels,
                 hidden_channels=config.hidden_channels,
                 output_channels=config.output_channels,
-                kernel_size=config.kernel_size
+                kernel_size=config.kernel_size,
+                dropout_rate=args.dropout_rate,
+                use_batch_norm=args.use_batch_norm,
+                use_spatial_dropout=args.use_spatial_dropout
             )
+            logger.info(f"Regularization: dropout={args.dropout_rate}, "
+                       f"batch_norm={args.use_batch_norm}, "
+                       f"spatial_dropout={args.use_spatial_dropout}")
         
         # Count parameters
         num_params = sum(p.numel() for p in model.parameters())
