@@ -76,12 +76,17 @@ def create_train_val_test_split(
     val_ratio: float = 0.15,
     test_start_date: Optional[str] = None,
     trainval_end_date: Optional[str] = None,
+    random_trainval_split: bool = True,
+    random_seed: int = 42,
 ) -> Tuple[xr.Dataset, xr.Dataset, xr.Dataset]:
-    """Split data by time ranges into train/val/test sets.
+    """Split data into train/val/test sets with flexible splitting strategies.
     
-    This function is adapted from graphcast_regional.training.create_train_val_test_split
-    and is compatible with ConvLSTM data format. It ensures temporal ordering is preserved
-    within each split.
+    This function supports two splitting strategies:
+    1. Random split for train/val (when random_trainval_split=True):
+       - Test set is split by time (temporal cutoff)
+       - Train/val are randomly sampled from remaining data
+    2. Sequential split (when random_trainval_split=False):
+       - All splits maintain temporal ordering (original behavior)
     
     Args:
         data: Full dataset with time dimension.
@@ -90,10 +95,13 @@ def create_train_val_test_split(
         train_ratio: Fraction of data for training (if years not specified).
         val_ratio: Fraction of data for validation (if years not specified).
         test_start_date: Date string (YYYY-MM-DD) when test set starts. If specified,
-                        data before this date is split into train/val using ratios.
+                        data before this date is split into train/val.
         trainval_end_date: Date string (YYYY-MM-DD) when train/val data ends. If specified,
                           only data before this date is used for training and validation,
                           and data from this date onwards is used for testing.
+        random_trainval_split: If True, randomly split train/val while keeping test temporal.
+                              If False, use sequential temporal splitting (default: True).
+        random_seed: Random seed for reproducible train/val splitting (default: 42).
         
     Returns:
         Tuple of (train_data, val_data, test_data).
@@ -102,24 +110,14 @@ def create_train_val_test_split(
         ValueError: If no training data is found or if temporal ordering is violated.
         
     Examples:
-        >>> # Year-based splitting
+        >>> # Random train/val split with temporal test split
         >>> train, val, test = create_train_val_test_split(
-        ...     data, train_end_year=2018, val_end_year=2019
+        ...     data, test_start_date='2020-01-01', random_trainval_split=True
         ... )
         
-        >>> # Ratio-based splitting
+        >>> # Sequential temporal splitting (original behavior)
         >>> train, val, test = create_train_val_test_split(
-        ...     data, train_ratio=0.7, val_ratio=0.15
-        ... )
-        
-        >>> # Date-based splitting with test cutoff
-        >>> train, val, test = create_train_val_test_split(
-        ...     data, test_start_date='2020-01-01', train_ratio=0.85, val_ratio=0.15
-        ... )
-        
-        >>> # Use only data before specified date for train/val
-        >>> train, val, test = create_train_val_test_split(
-        ...     data, trainval_end_date='2020-01-01', train_ratio=0.85, val_ratio=0.15
+        ...     data, test_start_date='2020-01-01', random_trainval_split=False
         ... )
     """
     logger.info("Splitting data into train/val/test sets...")
@@ -138,120 +136,106 @@ def create_train_val_test_split(
             "Temporal ordering must be preserved for time series prediction."
         )
     
-    # If trainval_end_date is specified, use it to split train/val from test
+    # Step 1: Split test set by time
     if trainval_end_date is not None:
         logger.info(f"Using trainval_end_date: train/val data before {trainval_end_date}, test data from {trainval_end_date} onwards")
-        
-        trainval_cutoff = np.datetime64(trainval_end_date)
-        
-        # Split into train+val and test
-        trainval_mask = times < trainval_cutoff
-        test_mask = times >= trainval_cutoff
-        
-        trainval_data = data.isel(time=trainval_mask)
-        test_data = data.isel(time=test_mask)
-        
-        # Further split train+val using ratios
-        n_trainval = len(trainval_data.time)
-        n_train = int(n_trainval * train_ratio / (train_ratio + val_ratio))
-        
-        train_data = trainval_data.isel(time=slice(0, n_train))
-        val_data = trainval_data.isel(time=slice(n_train, None))
-        
-        logger.info(f"Train+Val cutoff: {trainval_cutoff}")
-        logger.info(f"Train/Val split ratio: {train_ratio}:{val_ratio}")
-        
-    # If test_start_date is specified, use date-based splitting
+        test_cutoff = np.datetime64(trainval_end_date)
     elif test_start_date is not None:
-        logger.info(f"Using date-based split: test starts at {test_start_date}")
-        
+        logger.info(f"Using test_start_date: test starts at {test_start_date}")
         test_cutoff = np.datetime64(test_start_date)
+    elif train_end_year is not None and val_end_year is not None:
+        logger.info(f"Using year-based split: test starts after {val_end_year}")
+        test_cutoff = np.datetime64(f'{val_end_year + 1}-01-01')
+    else:
+        # No explicit test cutoff, use ratio-based splitting
+        logger.info(f"Using ratio-based split: train={train_ratio}, val={val_ratio}, test={1-train_ratio-val_ratio}")
+        n_total = len(times)
+        n_trainval = int(n_total * (train_ratio + val_ratio))
+        test_cutoff = times[n_trainval]
+        logger.info(f"Test cutoff determined by ratio: {test_cutoff}")
+    
+    # Split into train+val and test by time
+    trainval_mask = times < test_cutoff
+    test_mask = times >= test_cutoff
+    
+    trainval_data = data.isel(time=trainval_mask)
+    test_data = data.isel(time=test_mask)
+    
+    logger.info(f"Test cutoff: {test_cutoff}")
+    logger.info(f"Train+Val timesteps: {len(trainval_data.time)}")
+    logger.info(f"Test timesteps: {len(test_data.time)}")
+    
+    # Validate that we have training data
+    if len(trainval_data.time) == 0:
+        raise ValueError(
+            f"No training data found. Data time range is {times.min()} to {times.max()}. "
+            f"Test cutoff is {test_cutoff}. Please adjust split parameters."
+        )
+    
+    # Step 2: Split train and val
+    n_trainval = len(trainval_data.time)
+    n_train = int(n_trainval * train_ratio / (train_ratio + val_ratio))
+    n_val = n_trainval - n_train
+    
+    if random_trainval_split:
+        # Random split for train/val
+        logger.info(f"Using RANDOM train/val split with seed={random_seed}")
         
-        # Split into train+val and test
-        trainval_mask = times < test_cutoff
-        test_mask = times >= test_cutoff
+        # Set random seed for reproducibility
+        np.random.seed(random_seed)
         
-        trainval_data = data.isel(time=trainval_mask)
-        test_data = data.isel(time=test_mask)
+        # Generate random indices
+        indices = np.arange(n_trainval)
+        np.random.shuffle(indices)
         
-        # Further split train+val using ratios
-        n_trainval = len(trainval_data.time)
-        n_train = int(n_trainval * train_ratio / (train_ratio + val_ratio))
+        train_indices = np.sort(indices[:n_train])  # Sort to maintain some temporal locality
+        val_indices = np.sort(indices[n_train:])
+        
+        train_data = trainval_data.isel(time=train_indices)
+        val_data = trainval_data.isel(time=val_indices)
+        
+        logger.info(f"Random split: {n_train} train, {n_val} val samples")
+        
+    else:
+        # Sequential temporal split (original behavior)
+        logger.info(f"Using SEQUENTIAL train/val split")
         
         train_data = trainval_data.isel(time=slice(0, n_train))
         val_data = trainval_data.isel(time=slice(n_train, None))
         
-        logger.info(f"Train+Val cutoff: {test_cutoff}")
-        logger.info(f"Train/Val split ratio: {train_ratio}:{val_ratio}")
-        
-    # If years are not specified, use ratio-based splitting
-    elif train_end_year is None or val_end_year is None:
-        logger.info(f"Using ratio-based split: train={train_ratio}, val={val_ratio}, test={1-train_ratio-val_ratio}")
-        
-        n_total = len(times)
-        n_train = int(n_total * train_ratio)
-        n_val = int(n_total * val_ratio)
-        
-        train_data = data.isel(time=slice(0, n_train))
-        val_data = data.isel(time=slice(n_train, n_train + n_val))
-        test_data = data.isel(time=slice(n_train + n_val, None))
-    else:
-        # Use year-based splitting
-        logger.info(f"Using year-based split: train<={train_end_year}, val<={val_end_year}")
-        
-        # Create time-based masks
-        train_mask = times < np.datetime64(f'{train_end_year + 1}-01-01')
-        val_mask = (times >= np.datetime64(f'{train_end_year + 1}-01-01')) & \
-                   (times < np.datetime64(f'{val_end_year + 1}-01-01'))
-        test_mask = times >= np.datetime64(f'{val_end_year + 1}-01-01')
-        
-        # Split data
-        train_data = data.isel(time=train_mask)
-        val_data = data.isel(time=val_mask)
-        test_data = data.isel(time=test_mask)
+        logger.info(f"Sequential split: {n_train} train, {n_val} val samples")
     
     logger.info(f"Train timesteps: {len(train_data.time)}")
     logger.info(f"Val timesteps: {len(val_data.time)}")
     logger.info(f"Test timesteps: {len(test_data.time)}")
     
-    # Validate that we have training data
-    if len(train_data.time) == 0:
-        raise ValueError(
-            f"No training data found. Data time range is {times.min()} to {times.max()}. "
-            f"Please adjust train_end_year and val_end_year to match your data, "
-            f"or use ratio-based splitting by setting both to None."
-        )
-    
-    # Validate temporal ordering within each split
+    # Log time ranges for each split
     for split_name, split_data in [("train", train_data), ("val", val_data), ("test", test_data)]:
-        if len(split_data.time) > 1:
+        if len(split_data.time) > 0:
             split_times = split_data.time.values
-            if not np.all(split_times[:-1] <= split_times[1:]):
-                raise ValueError(
-                    f"Temporal ordering violated in {split_name} split. "
-                    f"Time coordinates must be monotonically increasing."
-                )
             logger.info(
                 f"{split_name.capitalize()} split time range: "
                 f"{split_times.min()} to {split_times.max()}"
             )
     
-    # Validate that splits don't overlap and cover all data
-    if len(train_data.time) > 0 and len(val_data.time) > 0:
-        if train_data.time.values[-1] >= val_data.time.values[0]:
+    # Validate test set temporal ordering (must be sequential)
+    if len(test_data.time) > 1:
+        test_times = test_data.time.values
+        if not np.all(test_times[:-1] <= test_times[1:]):
             raise ValueError(
-                "Train and validation splits overlap in time. "
-                "This violates temporal ordering for time series prediction."
+                "Test set temporal ordering violated. "
+                "Test data must maintain temporal sequence."
             )
     
-    if len(val_data.time) > 0 and len(test_data.time) > 0:
-        if val_data.time.values[-1] >= test_data.time.values[0]:
+    # Validate no overlap between trainval and test
+    if len(trainval_data.time) > 0 and len(test_data.time) > 0:
+        if trainval_data.time.values.max() >= test_data.time.values.min():
             raise ValueError(
-                "Validation and test splits overlap in time. "
-                "This violates temporal ordering for time series prediction."
+                "Train/Val and test splits overlap in time. "
+                "This violates temporal separation for time series prediction."
             )
     
-    logger.info("Data splitting completed successfully with temporal ordering validated")
+    logger.info("Data splitting completed successfully")
     
     return train_data, val_data, test_data
 
@@ -301,8 +285,8 @@ class ConvLSTMNormalizer:
             return data.rename(rename_dict)
         return data
     
-    def fit(self, train_data: xr.Dataset) -> None:
-        """Compute normalization statistics from training data.
+    def fit(self, train_data: xr.Dataset, use_dask: bool = True, n_workers: int = 4) -> None:
+        """Compute normalization statistics from training data with optional parallelization.
         
         Computes mean and standard deviation for HPA variables and log-transformed
         precipitation. Statistics are computed across time, lat, and lon dimensions,
@@ -311,11 +295,18 @@ class ConvLSTMNormalizer:
         Args:
             train_data: Training dataset with dimensions (time, level, lat, lon)
                        for HPA variables and (time, lat, lon) for precipitation.
+            use_dask: If True, use Dask for parallel computation (default: True).
+            n_workers: Number of parallel workers for Dask (default: 4).
                        
         Raises:
             ValueError: If required variables are missing from train_data.
         """
+        import time
+        start_time = time.time()
+        
         logger.info("Computing normalization statistics for ConvLSTM format...")
+        if use_dask:
+            logger.info(f"Using Dask parallelization with {n_workers} workers")
         
         # Rename variables if needed to match expected names
         data_renamed = self._rename_variables(train_data)
@@ -335,11 +326,40 @@ class ConvLSTMNormalizer:
         # log1p(x) = log(1 + x) handles zero values gracefully
         data_for_stats["precipitation"] = np.log1p(data_for_stats["precipitation"])
         
-        # Compute mean and std for each variable
-        # For HPA variables: compute across (time, lat, lon), preserve level dimension
-        # For precipitation: compute across (time, lat, lon)
-        self.mean = data_for_stats.mean(dim=["time", "lat", "lon"])
-        self.std = data_for_stats.std(dim=["time", "lat", "lon"])
+        if use_dask:
+            try:
+                import dask
+                import dask.array as da
+                from dask.diagnostics import ProgressBar
+                
+                # Convert to Dask arrays for parallel computation
+                logger.info("Converting to Dask arrays for parallel computation...")
+                
+                # Chunk the data for efficient parallel processing
+                # Chunk along time dimension to parallelize across timesteps
+                chunk_dict = {
+                    'time': min(100, len(data_for_stats.time)),  # Process 100 timesteps at a time
+                    'lat': -1,  # Keep spatial dimensions together
+                    'lon': -1
+                }
+                
+                data_for_stats = data_for_stats.chunk(chunk_dict)
+                
+                # Compute mean and std with Dask
+                logger.info("Computing statistics in parallel...")
+                with ProgressBar():
+                    self.mean = data_for_stats.mean(dim=["time", "lat", "lon"]).compute(num_workers=n_workers)
+                    self.std = data_for_stats.std(dim=["time", "lat", "lon"]).compute(num_workers=n_workers)
+                
+            except ImportError:
+                logger.warning("Dask not available, falling back to sequential computation")
+                use_dask = False
+        
+        if not use_dask:
+            # Sequential computation (original behavior)
+            logger.info("Computing statistics sequentially...")
+            self.mean = data_for_stats.mean(dim=["time", "lat", "lon"])
+            self.std = data_for_stats.std(dim=["time", "lat", "lon"])
         
         # Avoid division by zero - replace zero std with 1.0
         for var_name in self.std.data_vars:
@@ -356,7 +376,8 @@ class ConvLSTMNormalizer:
         
         self._is_fitted = True
         
-        logger.info("Normalization statistics computed successfully")
+        elapsed_time = time.time() - start_time
+        logger.info(f"Normalization statistics computed successfully in {elapsed_time:.2f} seconds")
         logger.info(f"Variables: {list(self.mean.data_vars)}")
         logger.info(f"Precipitation statistics (log-transformed): "
                    f"mean={float(self.mean['precipitation'].values):.4f}, "
