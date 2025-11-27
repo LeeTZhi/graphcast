@@ -286,72 +286,67 @@ class ConvLSTMNormalizer:
         return data
     
     def fit(self, train_data: xr.Dataset) -> None:
-        """Compute normalization statistics from training data.
-        
-        Computes mean and standard deviation for HPA variables and log-transformed
-        precipitation. Statistics are computed across time, lat, and lon dimensions,
-        preserving the level dimension for HPA variables.
-        
-        Args:
-            train_data: Training dataset with dimensions (time, level, lat, lon)
-                       for HPA variables and (time, lat, lon) for precipitation.
-                       
-        Raises:
-            ValueError: If required variables are missing from train_data.
-        """
+        """Compute normalization statistics efficiently."""
         import time
         start_time = time.time()
         
-        logger.info("Computing normalization statistics...")
+        logger.info("Computing normalization statistics (Optimized)...")
         
-        # Rename variables if needed to match expected names
-        data_renamed = self._rename_variables(train_data)
+        # 1. 变量重命名
+        data = self._rename_variables(train_data)
         
-        # Validate required variables
-        for var in HPA_VARIABLES:
-            if var not in data_renamed:
-                raise ValueError(f"Missing required HPA variable: {var}")
+        # 2. 验证变量
+        missing_hpa = [v for v in HPA_VARIABLES if v not in data]
+        if missing_hpa:
+            raise ValueError(f"Missing HPA variables: {missing_hpa}")
+        if "precipitation" not in data:
+            raise ValueError("Missing precipitation variable")
+
+        # =======================================================
+        # 优化点 1: 内存加载 (如果内存足够)
+        # 如果你的内存 > 数据集大小，取消下面这行的注释，速度会提升 10-100 倍
+        data = data.load() 
+        # =======================================================
+
+        # 3. 处理 HPA 变量 (批量计算)
+        # HPA 变量都有 (time, level, lat, lon) 维度，可以一次性计算
+        logger.info("Computing HPA stats in batch...")
         
-        if "precipitation" not in data_renamed:
-            raise ValueError("Missing required variable: precipitation")
+        # 选取所有 HPA 变量组成子集
+        hpa_subset = data[HPA_VARIABLES]
         
-        # Compute statistics for HPA variables directly (no transformation needed)
-        mean_dict = {}
-        std_dict = {}
+        # 一次性计算所有 HPA 变量的 Mean 和 Std
+        # Xarray/Dask 会尝试合并 IO 操作
+        self.mean = hpa_subset.mean(dim=["time", "lat", "lon"]).compute()
+        self.std = hpa_subset.std(dim=["time", "lat", "lon"]).compute()
+
+        # 4. 处理降水 (Precipitation)
+        # 需要单独处理，因为它需要 log1p 变换，且没有 level 维度
+        logger.info("Computing precipitation stats...")
         
-        for var in HPA_VARIABLES:
-            logger.info(f"  Computing stats for {var}...")
-            mean_dict[var] = data_renamed[var].mean(dim=["time", "lat", "lon"])
-            std_dict[var] = data_renamed[var].std(dim=["time", "lat", "lon"])
+        # 使用 log1p 变换
+        # 注意：这里尽量使用 map_blocks 或者直接操作，避免过早触发计算
+        precip_log = np.log1p(data["precipitation"])
         
-        # For precipitation: apply log1p transformation before computing statistics
-        # log1p(x) = log(1 + x) handles zero values gracefully
-        logger.info("  Computing stats for precipitation (with log1p transform)...")
-        precip_log = np.log1p(data_renamed["precipitation"])
-        mean_dict["precipitation"] = precip_log.mean(dim=["time", "lat", "lon"])
-        std_dict["precipitation"] = precip_log.std(dim=["time", "lat", "lon"])
+        precip_mean = precip_log.mean(dim=["time", "lat", "lon"]).compute()
+        precip_std = precip_log.std(dim=["time", "lat", "lon"]).compute()
         
-        # Combine into xarray Datasets
-        self.mean = xr.Dataset(mean_dict)
-        self.std = xr.Dataset(std_dict)
+        # 5. 合并结果
+        self.mean["precipitation"] = precip_mean
+        self.std["precipitation"] = precip_std
         
-        # Avoid division by zero - replace zero std with 1.0
+        # 6. 处理标准差为 0 的情况 (防止除零错误)
+        # 使用 where 替换，比循环快且简洁
         for var_name in self.std.data_vars:
-            std_values = self.std[var_name].values
-            std_values = np.where(std_values == 0, 1.0, std_values)
-            self.std[var_name].values = std_values
-            
-            # Log warning if any constant features detected
-            if np.any(std_values == 1.0):
-                logger.warning(
-                    f"Variable {var_name} has zero standard deviation in some locations. "
-                    f"Replaced with 1.0 to avoid division by zero."
-                )
-        
+            # 只有当确实存在 0 时才替换，减少操作
+            if (self.std[var_name] == 0).any():
+                self.std[var_name] = xr.where(self.std[var_name] == 0, 1.0, self.std[var_name])
+                logger.warning(f"Replaced 0 std with 1.0 for {var_name}")
+
         self._is_fitted = True
         
-        elapsed_time = time.time() - start_time
-        logger.info(f"✓ Normalization completed in {elapsed_time:.2f} seconds")
+        elapsed = time.time() - start_time
+        logger.info(f"✓ Normalization completed in {elapsed:.2f} seconds")
         logger.info(f"  Variables: {list(self.mean.data_vars)}")
         logger.info(f"  Precipitation stats (log-transformed): "
                    f"mean={float(self.mean['precipitation'].values):.4f}, "
