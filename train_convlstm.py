@@ -593,13 +593,15 @@ def main():
     normalizer_path = output_dir / "normalizer.pkl"
     normalizer = ConvLSTMNormalizer()
     
-    # Check if normalizer already exists (from previous run)
-    if normalizer_path.exists() and args.resume is None:
+    # Check if normalizer already exists (from previous run or resume)
+    if normalizer_path.exists():
         logger.info(f"Found existing normalizer at {normalizer_path}")
         logger.info("Loading cached normalization statistics...")
         try:
             normalizer.load(str(normalizer_path))
             logger.info("Normalizer loaded successfully (skipped recomputation)")
+            if args.resume is not None:
+                logger.info("Using normalizer from checkpoint directory for resumed training")
         except Exception as e:
             logger.warning(f"Failed to load cached normalizer: {e}")
             logger.info("Computing normalization statistics from scratch...")
