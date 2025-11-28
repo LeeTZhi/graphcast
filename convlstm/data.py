@@ -76,18 +76,19 @@ def create_train_val_test_split(
     val_ratio: float = 0.15,
     test_start_date: Optional[str] = None,
     trainval_end_date: Optional[str] = None,
-    random_trainval_split: bool = False,
+    random_trainval_split: bool = True,
     random_seed: int = 42,
 ) -> Tuple[xr.Dataset, xr.Dataset, xr.Dataset]:
     """Split data into train/val/test sets with flexible splitting strategies.
     
     This function supports two splitting strategies:
-    1. Sequential split (when random_trainval_split=False, DEFAULT):
-       - All splits maintain temporal ordering
-       - Best for time series prediction (avoids data leakage)
-    2. Random split for train/val (when random_trainval_split=True):
+    1. Random split for train/val (when random_trainval_split=True, DEFAULT):
        - Test set is split by time (temporal cutoff)
        - Train/val are randomly sampled from remaining data
+       - Recommended for better generalization
+    2. Sequential split (when random_trainval_split=False):
+       - All splits maintain temporal ordering
+       - Traditional time series approach
     
     Args:
         data: Full dataset with time dimension.
@@ -101,7 +102,7 @@ def create_train_val_test_split(
                           only data before this date is used for training and validation,
                           and data from this date onwards is used for testing.
         random_trainval_split: If True, randomly split train/val while keeping test temporal.
-                              If False, use sequential temporal splitting (default: False).
+                              If False, use sequential temporal splitting (default: True).
         random_seed: Random seed for reproducible train/val splitting (default: 42).
         
     Returns:
@@ -111,14 +112,14 @@ def create_train_val_test_split(
         ValueError: If no training data is found or if temporal ordering is violated.
         
     Examples:
-        >>> # Sequential temporal splitting (DEFAULT, recommended for time series)
+        >>> # Random train/val split with temporal test split (DEFAULT, recommended)
         >>> train, val, test = create_train_val_test_split(
         ...     data, test_start_date='2020-01-01'
         ... )
         
-        >>> # Random train/val split with temporal test split
+        >>> # Sequential temporal splitting (traditional approach)
         >>> train, val, test = create_train_val_test_split(
-        ...     data, test_start_date='2020-01-01', random_trainval_split=True
+        ...     data, test_start_date='2020-01-01', random_trainval_split=False
         ... )
     """
     logger.info("Splitting data into train/val/test sets...")
@@ -179,7 +180,7 @@ def create_train_val_test_split(
     n_val = n_trainval - n_train
     
     if random_trainval_split:
-        # Random split for train/val
+        # Random split for train/val (DEFAULT)
         logger.info(f"Using RANDOM train/val split with seed={random_seed}")
         
         # Set random seed for reproducibility
@@ -189,16 +190,17 @@ def create_train_val_test_split(
         indices = np.arange(n_trainval)
         np.random.shuffle(indices)
         
-        train_indices = np.sort(indices[:n_train])  # Sort to maintain some temporal locality
-        val_indices = np.sort(indices[n_train:])
+        # Split indices (no sorting to maintain randomness)
+        train_indices = indices[:n_train]
+        val_indices = indices[n_train:]
         
         train_data = trainval_data.isel(time=train_indices)
         val_data = trainval_data.isel(time=val_indices)
         
-        logger.info(f"Random split: {n_train} train, {n_val} val samples")
+        logger.info(f"Random split: {n_train} train, {n_val} val samples (shuffled)")
         
     else:
-        # Sequential temporal split (original behavior)
+        # Sequential temporal split
         logger.info(f"Using SEQUENTIAL train/val split")
         
         train_data = trainval_data.isel(time=slice(0, n_train))
@@ -235,6 +237,9 @@ def create_train_val_test_split(
                 "Train/Val and test splits overlap in time. "
                 "This violates temporal separation for time series prediction."
             )
+    
+    # Note: When using random_trainval_split=True, train and val may not be temporally ordered
+    # This is intentional and helps with generalization
     
     logger.info("Data splitting completed successfully")
     
