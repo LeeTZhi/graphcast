@@ -13,6 +13,7 @@ import sys
 from convlstm.model import ConvLSTMUNet, WeightedPrecipitationLoss
 from convlstm.config import ConvLSTMConfig
 from convlstm.data import ConvLSTMDataset, RegionConfig, ConvLSTMNormalizer
+from convlstm.masked_loss import MaskedMSELoss, CombinedMaskedLoss
 
 
 # Module-level logger
@@ -291,7 +292,9 @@ class ConvLSTMTrainer:
                  region_config: RegionConfig,
                  normalizer: ConvLSTMNormalizer,
                  device: Optional[torch.device] = None,
-                 logger: Optional[logging.Logger] = None):
+                 logger: Optional[logging.Logger] = None,
+                 use_masked_loss: bool = False,
+                 filled_weight: float = 0.1):
         """Initialize ConvLSTMTrainer.
         
         Args:
@@ -301,6 +304,8 @@ class ConvLSTMTrainer:
             normalizer: ConvLSTMNormalizer for preprocessing
             device: Device to run training on (default: auto-detect)
             logger: Logger instance (default: create new logger)
+            use_masked_loss: Whether to use masked loss (default: False)
+            filled_weight: Weight for filled/invalid values in masked loss (default: 0.1)
         """
         self.model = model
         self.config = config
@@ -334,22 +339,32 @@ class ConvLSTMTrainer:
         )
         
         # Initialize loss function
-        # Get latitude coordinates from region config for weighting
-        lat_coords = None
-        if hasattr(region_config, 'downstream_lat_range'):
-            import numpy as np
-            lat_min, lat_max = region_config.downstream_lat_range
-            # Estimate number of latitude points (this should match actual data)
-            # For now, we'll set it to None and let the user provide it if needed
-            lat_coords = None
+        self.use_masked_loss = use_masked_loss
+        self.filled_weight = filled_weight
         
-        self.loss_fn = WeightedPrecipitationLoss(
-            high_precip_threshold=config.high_precip_threshold,
-            high_precip_weight=config.high_precip_weight,
-            extreme_precip_threshold=getattr(config, 'extreme_precip_threshold', 50.0),
-            extreme_precip_weight=getattr(config, 'extreme_precip_weight', 10.0),
-            latitude_coords=lat_coords
-        ).to(self.device)
+        if use_masked_loss:
+            # Use masked loss that handles validity masks
+            self.loss_fn = CombinedMaskedLoss(
+                mse_weight=1.0,
+                gradient_weight=0.1,
+                filled_weight=filled_weight
+            ).to(self.device)
+            self.logger.info(f"Using masked loss with filled_weight={filled_weight}")
+        else:
+            # Use standard weighted precipitation loss
+            lat_coords = None
+            if hasattr(region_config, 'downstream_lat_range'):
+                import numpy as np
+                lat_min, lat_max = region_config.downstream_lat_range
+                lat_coords = None
+            
+            self.loss_fn = WeightedPrecipitationLoss(
+                high_precip_threshold=config.high_precip_threshold,
+                high_precip_weight=config.high_precip_weight,
+                extreme_precip_threshold=getattr(config, 'extreme_precip_threshold', 50.0),
+                extreme_precip_weight=getattr(config, 'extreme_precip_weight', 10.0),
+                latitude_coords=lat_coords
+            ).to(self.device)
         
         # Initialize GradScaler for mixed precision training
         self.scaler = GradScaler(enabled=config.use_amp)
@@ -383,21 +398,36 @@ class ConvLSTMTrainer:
         """Execute one training step.
         
         Args:
-            batch: Tuple of (inputs, targets) from DataLoader
+            batch: Tuple of (inputs, targets) or (inputs, targets, mask) from DataLoader
                 inputs: [B, T, C, H, W]
                 targets: [B, H, W]
+                mask: [B, H, W] (optional, for masked loss)
         
         Returns:
             Loss value for this batch
         """
-        inputs, targets = batch
+        # Handle both masked and unmasked batches
+        if len(batch) == 3:
+            inputs, targets, mask = batch
+            mask = mask.to(self.device)
+        else:
+            inputs, targets = batch
+            mask = None
+        
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
         
         # Forward pass with mixed precision
         with autocast(enabled=self.config.use_amp):
             predictions = self.model(inputs)
-            loss = self.loss_fn(predictions, targets)
+            
+            # Compute loss (with or without mask)
+            if self.use_masked_loss and mask is not None:
+                # Masked loss returns dict with 'total' key
+                loss_dict = self.loss_fn(predictions, targets, mask)
+                loss = loss_dict['total']
+            else:
+                loss = self.loss_fn(predictions, targets)
             
             # Scale loss for gradient accumulation
             loss = loss / self.config.gradient_accumulation_steps
@@ -412,12 +442,19 @@ class ConvLSTMTrainer:
         """Execute one validation step.
         
         Args:
-            batch: Tuple of (inputs, targets) from DataLoader
+            batch: Tuple of (inputs, targets) or (inputs, targets, mask) from DataLoader
         
         Returns:
             Loss value for this batch
         """
-        inputs, targets = batch
+        # Handle both masked and unmasked batches
+        if len(batch) == 3:
+            inputs, targets, mask = batch
+            mask = mask.to(self.device)
+        else:
+            inputs, targets = batch
+            mask = None
+        
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
         
@@ -425,7 +462,13 @@ class ConvLSTMTrainer:
         with torch.no_grad():
             with autocast(enabled=self.config.use_amp):
                 predictions = self.model(inputs)
-                loss = self.loss_fn(predictions, targets)
+                
+                # Compute loss (with or without mask)
+                if self.use_masked_loss and mask is not None:
+                    loss_dict = self.loss_fn(predictions, targets, mask)
+                    loss = loss_dict['total']
+                else:
+                    loss = self.loss_fn(predictions, targets)
         
         return loss.item()
     
