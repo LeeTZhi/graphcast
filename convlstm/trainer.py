@@ -11,6 +11,7 @@ import time
 import sys
 
 from convlstm.model import ConvLSTMUNet, WeightedPrecipitationLoss
+from convlstm.model_deep import DeepConvLSTMUNet
 from convlstm.config import ConvLSTMConfig
 from convlstm.data import ConvLSTMDataset, RegionConfig, ConvLSTMNormalizer
 from convlstm.masked_loss import MaskedMSELoss, CombinedMaskedLoss
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def save_model_checkpoint(
-    model: ConvLSTMUNet,
+    model: Union[ConvLSTMUNet, 'DeepConvLSTMUNet'],
     filepath: Union[str, Path],
     config: Optional[ConvLSTMConfig] = None,
     region_config: Optional[RegionConfig] = None,
@@ -40,7 +41,7 @@ def save_model_checkpoint(
     with optional training state and configuration.
     
     Args:
-        model: ConvLSTMUNet model to save
+        model: ConvLSTMUNet or DeepConvLSTMUNet model to save
         filepath: Path to save checkpoint file
         config: Optional ConvLSTMConfig with model hyperparameters
         region_config: Optional RegionConfig with spatial boundaries
@@ -79,7 +80,7 @@ def save_model_checkpoint(
         
         # Model state
         'model_state_dict': model.state_dict(),
-        'model_type': 'ConvLSTMUNet',
+        'model_type': type(model).__name__,
         
         # Model architecture details for reconstruction
         'model_architecture': {
@@ -87,6 +88,8 @@ def save_model_checkpoint(
             'hidden_channels': model.hidden_channels,
             'output_channels': model.output_channels,
             'kernel_size': model.kernel_size,
+            'use_attention': getattr(model, 'use_attention', False),
+            'use_group_norm': getattr(model, 'use_group_norm', False),
         }
     }
     
@@ -122,7 +125,7 @@ def save_model_checkpoint(
 
 def load_model_checkpoint(
     filepath: Union[str, Path],
-    model: Optional[ConvLSTMUNet] = None,
+    model: Optional[Union[ConvLSTMUNet, 'DeepConvLSTMUNet']] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     device: Optional[torch.device] = None,
@@ -136,7 +139,7 @@ def load_model_checkpoint(
     
     Args:
         filepath: Path to checkpoint file
-        model: Optional ConvLSTMUNet model to load state into
+        model: Optional ConvLSTMUNet or DeepConvLSTMUNet model to load state into
                If None, only returns checkpoint dictionary
         optimizer: Optional optimizer to load state into
         scheduler: Optional scheduler to load state into
@@ -287,7 +290,7 @@ class ConvLSTMTrainer:
     """
     
     def __init__(self,
-                 model: ConvLSTMUNet,
+                 model: Union[ConvLSTMUNet, DeepConvLSTMUNet],
                  config: ConvLSTMConfig,
                  region_config: RegionConfig,
                  normalizer: ConvLSTMNormalizer,
@@ -298,7 +301,7 @@ class ConvLSTMTrainer:
         """Initialize ConvLSTMTrainer.
         
         Args:
-            model: ConvLSTMUNet instance
+            model: ConvLSTMUNet or DeepConvLSTMUNet instance
             config: ConvLSTMConfig with hyperparameters
             region_config: RegionConfig for boundaries
             normalizer: ConvLSTMNormalizer for preprocessing
@@ -390,7 +393,15 @@ class ConvLSTMTrainer:
         self.epochs_without_improvement = 0
         
         self.logger.info(f"Initialized ConvLSTMTrainer on device: {self.device}")
+        self.logger.info(f"Model type: {type(model).__name__}")
         self.logger.info(f"Model architecture: {config.hidden_channels}")
+        
+        # Log attention and normalization features
+        if hasattr(model, 'use_attention'):
+            self.logger.info(f"Self-attention enabled: {model.use_attention}")
+        if hasattr(model, 'use_group_norm'):
+            self.logger.info(f"Group normalization enabled: {getattr(model, 'use_group_norm', False)}")
+        
         self.logger.info(f"Mixed precision training: {config.use_amp}")
         self.logger.info(f"Gradient accumulation steps: {config.gradient_accumulation_steps}")
     
@@ -710,7 +721,7 @@ class ConvLSTMTrainer:
             
             # Model state
             'model_state_dict': self.model.state_dict(),
-            'model_type': 'ConvLSTMUNet',
+            'model_type': type(self.model).__name__,
             
             # Optimizer and scheduler state
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -727,6 +738,8 @@ class ConvLSTMTrainer:
                 'hidden_channels': self.model.hidden_channels,
                 'output_channels': self.model.output_channels,
                 'kernel_size': self.model.kernel_size,
+                'use_attention': getattr(self.model, 'use_attention', False),
+                'use_group_norm': getattr(self.model, 'use_group_norm', False),
             }
         }
         

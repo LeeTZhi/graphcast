@@ -286,14 +286,26 @@ Examples:
     regularization_group.add_argument(
         '--use-batch-norm',
         action='store_true',
-        default=True,
-        help='Use batch normalization (default: True)'
+        default=False,
+        help='Use batch normalization (default: False, not recommended for small batches)'
     )
     regularization_group.add_argument(
         '--no-batch-norm',
         action='store_false',
         dest='use_batch_norm',
         help='Disable batch normalization'
+    )
+    regularization_group.add_argument(
+        '--use-group-norm',
+        action='store_true',
+        default=True,
+        help='Use group normalization in ConvLSTM cells (default: True, recommended)'
+    )
+    regularization_group.add_argument(
+        '--no-group-norm',
+        action='store_false',
+        dest='use_group_norm',
+        help='Disable group normalization'
     )
     regularization_group.add_argument(
         '--use-spatial-dropout',
@@ -306,6 +318,18 @@ Examples:
         action='store_false',
         dest='use_spatial_dropout',
         help='Use regular dropout instead of spatial dropout'
+    )
+    regularization_group.add_argument(
+        '--use-attention',
+        action='store_true',
+        default=True,
+        help='Use self-attention at bottleneck (default: True, recommended)'
+    )
+    regularization_group.add_argument(
+        '--no-attention',
+        action='store_false',
+        dest='use_attention',
+        help='Disable self-attention mechanism'
     )
     
     # Training configuration
@@ -510,6 +534,8 @@ def main():
     logger.info(f"  Model type: {args.model_type}")
     logger.info(f"  Include upstream: {args.include_upstream}")
     logger.info(f"  Hidden channels: {args.hidden_channels}")
+    logger.info(f"  Self-attention: {args.use_attention}")
+    logger.info(f"  Group normalization: {args.use_group_norm}")
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info(f"  Learning rate: {args.learning_rate}")
     logger.info(f"  Number of epochs: {args.num_epochs}")
@@ -696,8 +722,12 @@ def main():
                 input_channels=config.input_channels,
                 hidden_channels=config.hidden_channels,
                 output_channels=config.output_channels,
-                kernel_size=config.kernel_size
+                kernel_size=config.kernel_size,
+                use_attention=args.use_attention,
+                use_group_norm=args.use_group_norm
             )
+            logger.info(f"Shallow model features: attention={args.use_attention}, "
+                       f"group_norm={args.use_group_norm}")
         else:  # deep
             model = DeepConvLSTMUNet(
                 input_channels=config.input_channels,
@@ -706,11 +736,15 @@ def main():
                 kernel_size=config.kernel_size,
                 dropout_rate=args.dropout_rate,
                 use_batch_norm=args.use_batch_norm,
-                use_spatial_dropout=args.use_spatial_dropout
+                use_group_norm=args.use_group_norm,
+                use_spatial_dropout=args.use_spatial_dropout,
+                use_attention=args.use_attention
             )
-            logger.info(f"Regularization: dropout={args.dropout_rate}, "
+            logger.info(f"Deep model regularization: dropout={args.dropout_rate}, "
                        f"batch_norm={args.use_batch_norm}, "
-                       f"spatial_dropout={args.use_spatial_dropout}")
+                       f"group_norm={args.use_group_norm}, "
+                       f"spatial_dropout={args.use_spatial_dropout}, "
+                       f"attention={args.use_attention}")
         
         # Count parameters
         num_params = sum(p.numel() for p in model.parameters())

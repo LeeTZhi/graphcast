@@ -6,7 +6,7 @@ This is an enhanced version with more encoder/decoder layers.
 import torch
 import torch.nn as nn
 from typing import List
-from convlstm.model import ConvLSTMCell
+from convlstm.model import ConvLSTMCell, SelfAttention
 
 
 class DeepConvLSTMUNet(nn.Module):
@@ -30,8 +30,10 @@ class DeepConvLSTMUNet(nn.Module):
                  output_channels: int = 1,
                  kernel_size: int = 3,
                  dropout_rate: float = 0.2,
-                 use_batch_norm: bool = True,
-                 use_spatial_dropout: bool = True):
+                 use_batch_norm: bool = False,
+                 use_group_norm: bool = True,
+                 use_spatial_dropout: bool = True,
+                 use_attention: bool = True):
         """Initialize DeepConvLSTMUNet with regularization.
         
         Args:
@@ -40,8 +42,10 @@ class DeepConvLSTMUNet(nn.Module):
             output_channels: Number of output channels (default: 1)
             kernel_size: Convolutional kernel size (default: 3)
             dropout_rate: Dropout probability (default: 0.2, set to 0 to disable)
-            use_batch_norm: Whether to use batch normalization (default: True)
+            use_batch_norm: Whether to use batch normalization (default: False, not recommended)
+            use_group_norm: Whether to use group normalization in ConvLSTM cells (default: True, recommended)
             use_spatial_dropout: Use spatial dropout instead of regular dropout (default: True)
+            use_attention: Whether to use self-attention at bottleneck (default: True)
         """
         super(DeepConvLSTMUNet, self).__init__()
         
@@ -58,12 +62,16 @@ class DeepConvLSTMUNet(nn.Module):
         self.num_levels = len(hidden_channels)
         self.dropout_rate = dropout_rate
         self.use_batch_norm = use_batch_norm
+        self.use_group_norm = use_group_norm
+        self.use_attention = use_attention
         
-        # Encoder layers
+        # Encoder layers (with Group Normalization support)
         self.encoders = nn.ModuleList()
-        self.encoders.append(ConvLSTMCell(input_channels, hidden_channels[0], kernel_size))
+        self.encoders.append(ConvLSTMCell(input_channels, hidden_channels[0], kernel_size, 
+                                         use_group_norm=use_group_norm))
         for i in range(1, self.num_levels - 1):
-            self.encoders.append(ConvLSTMCell(hidden_channels[i-1], hidden_channels[i], kernel_size))
+            self.encoders.append(ConvLSTMCell(hidden_channels[i-1], hidden_channels[i], kernel_size,
+                                             use_group_norm=use_group_norm))
         
         # Encoder batch normalization (optional)
         if use_batch_norm:
@@ -85,8 +93,13 @@ class DeepConvLSTMUNet(nn.Module):
         # Pooling layers
         self.pools = nn.ModuleList([nn.MaxPool2d(2, 2) for _ in range(self.num_levels - 1)])
         
-        # Bottleneck
-        self.bottleneck = ConvLSTMCell(hidden_channels[-2], hidden_channels[-1], kernel_size)
+        # Bottleneck (with Group Normalization support)
+        self.bottleneck = ConvLSTMCell(hidden_channels[-2], hidden_channels[-1], kernel_size,
+                                      use_group_norm=use_group_norm)
+        
+        # Self-Attention at bottleneck (captures global context at lowest resolution)
+        if use_attention:
+            self.attention = SelfAttention(in_channels=hidden_channels[-1])
         
         # Bottleneck batch norm and dropout
         if use_batch_norm:
@@ -97,12 +110,13 @@ class DeepConvLSTMUNet(nn.Module):
             else:
                 self.bottleneck_dropout = nn.Dropout(dropout_rate * 1.5)
         
-        # Decoder layers
+        # Decoder layers (with Group Normalization support)
         self.decoders = nn.ModuleList()
         for i in range(self.num_levels - 2, -1, -1):
             # Input: upsampled + skip connection
             decoder_input_dim = hidden_channels[i+1] + hidden_channels[i]
-            self.decoders.append(ConvLSTMCell(decoder_input_dim, hidden_channels[i], kernel_size))
+            self.decoders.append(ConvLSTMCell(decoder_input_dim, hidden_channels[i], kernel_size,
+                                             use_group_norm=use_group_norm))
         
         # Decoder batch normalization (optional)
         if use_batch_norm:
@@ -179,7 +193,11 @@ class DeepConvLSTMUNet(nn.Module):
             # Bottleneck with regularization
             h_bot, c_bot = self.bottleneck(current_input, (h_bot, c_bot))
             
-            # Apply batch normalization to bottleneck
+            # Apply Self-Attention at bottleneck (captures global context at each timestep)
+            if self.use_attention:
+                h_bot = self.attention(h_bot)
+            
+            # Apply batch normalization to bottleneck (if enabled, though not recommended)
             if self.use_batch_norm:
                 h_bot = self.bottleneck_bn(h_bot)
             

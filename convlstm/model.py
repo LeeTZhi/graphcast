@@ -2,6 +2,7 @@
 
 This module implements the core ConvLSTM architecture including:
 - ConvLSTMCell: Single cell for processing one timestep
+- SelfAttention: Self-attention module for capturing long-range dependencies
 - ConvLSTMUNet: Full encoder-decoder architecture with skip connections
 - WeightedPrecipitationLoss: Custom loss function with precipitation and latitude weighting
 """
@@ -10,6 +11,81 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Tuple, List, Optional
+
+
+class SelfAttention(nn.Module):
+    """Self-Attention Block (Non-local Neural Network style).
+    
+    This module captures long-range dependencies by calculating the relationship
+    between every pixel and every other pixel in the feature map.
+    
+    Attributes:
+        in_channels: Number of input channels
+        inter_channels: Reduced channels for Q and K (typically in_channels // 8)
+        gamma: Learnable scale parameter for attention output
+    """
+    
+    def __init__(self, in_channels: int):
+        """Initialize SelfAttention.
+        
+        Args:
+            in_channels: Number of input channels
+        """
+        super(SelfAttention, self).__init__()
+        
+        self.in_channels = in_channels
+        # Q, K usually reduce channels to save memory (e.g., 1/8)
+        self.inter_channels = in_channels // 8 if in_channels >= 8 else in_channels // 2
+
+        # 1x1 Convs to generate Query, Key, Value
+        self.query_conv = nn.Conv2d(in_channels, self.inter_channels, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, self.inter_channels, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        
+        # Learnable scale parameter, initialized to 0
+        # This allows the network to start with local features and gradually learn global attention
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply self-attention.
+        
+        Args:
+            x: Input feature map [Batch, Channel, Height, Width]
+            
+        Returns:
+            out: Attention-enhanced feature map [B, C, H, W]
+        """
+        batch_size, C, H, W = x.size()
+        N = H * W  # Total number of spatial locations
+
+        # --- Query ---
+        # proj_query: [B, C', H, W] -> view [B, C', N] -> permute [B, N, C']
+        proj_query = self.query_conv(x).view(batch_size, -1, N).permute(0, 2, 1)
+
+        # --- Key ---
+        # proj_key: [B, C', H, W] -> view [B, C', N]
+        proj_key = self.key_conv(x).view(batch_size, -1, N)
+
+        # --- Attention Map ---
+        # Energy: [B, N, N] (Relationship between every pixel i and j)
+        energy = torch.bmm(proj_query, proj_key)
+        attention = self.softmax(energy)  # Normalize to probability
+
+        # --- Value ---
+        # proj_value: [B, C, H, W] -> view [B, C, N]
+        proj_value = self.value_conv(x).view(batch_size, -1, N)
+
+        # --- Output ---
+        # out: [B, C, N] -> view [B, C, H, W]
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C, H, W)
+        
+        # Residual connection with learnable weight
+        out = self.gamma * out + x
+        
+        return out
 
 
 class ConvLSTMCell(nn.Module):
@@ -26,10 +102,12 @@ class ConvLSTMCell(nn.Module):
         kernel_size: Size of convolutional kernel
         bias: Whether to use bias in convolutions
         padding: Padding size to maintain spatial dimensions
+        use_group_norm: Whether to use Group Normalization
     """
     
     def __init__(self, input_dim: int, hidden_dim: int, 
-                 kernel_size: int = 3, bias: bool = True):
+                 kernel_size: int = 3, bias: bool = True,
+                 use_group_norm: bool = False):
         """Initialize ConvLSTMCell.
         
         Args:
@@ -37,6 +115,7 @@ class ConvLSTMCell(nn.Module):
             hidden_dim: Number of hidden state channels
             kernel_size: Size of convolutional kernel (default: 3)
             bias: Whether to use bias in convolutions (default: True)
+            use_group_norm: Whether to use Group Normalization (default: False)
         """
         super(ConvLSTMCell, self).__init__()
         
@@ -45,6 +124,7 @@ class ConvLSTMCell(nn.Module):
         self.kernel_size = kernel_size
         self.padding = kernel_size // 2
         self.bias = bias
+        self.use_group_norm = use_group_norm
         
         # Single convolution that computes all 4 gates at once
         # Input: concatenation of input and hidden state
@@ -56,6 +136,14 @@ class ConvLSTMCell(nn.Module):
             padding=self.padding,
             bias=bias
         )
+        
+        # Group Normalization (recommended over Batch Normalization for small batches)
+        if use_group_norm:
+            # num_groups must divide 4*hidden_dim
+            num_groups = min(16, 4 * hidden_dim)
+            while (4 * hidden_dim) % num_groups != 0:
+                num_groups -= 1
+            self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=4 * hidden_dim)
     
     def forward(self, input_tensor: torch.Tensor, 
                 cur_state: Tuple[torch.Tensor, torch.Tensor]
@@ -80,6 +168,10 @@ class ConvLSTMCell(nn.Module):
         
         # Apply convolution to compute all gates
         combined_conv = self.conv(combined)
+        
+        # Apply Group Normalization if enabled
+        if self.use_group_norm:
+            combined_conv = self.norm(combined_conv)
         
         # Split into 4 gates
         cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
@@ -140,7 +232,9 @@ class ConvLSTMUNet(nn.Module):
     def __init__(self, input_channels: int = 56, 
                  hidden_channels: List[int] = None,
                  output_channels: int = 1,
-                 kernel_size: int = 3):
+                 kernel_size: int = 3,
+                 use_attention: bool = True,
+                 use_group_norm: bool = False):
         """Initialize ConvLSTMUNet.
         
         Args:
@@ -148,6 +242,8 @@ class ConvLSTMUNet(nn.Module):
             hidden_channels: List of hidden dimensions (default: [32, 64])
             output_channels: Number of output channels (default: 1)
             kernel_size: Size of convolutional kernel (default: 3)
+            use_attention: Whether to use self-attention at bottleneck (default: True)
+            use_group_norm: Whether to use Group Normalization in ConvLSTM cells (default: False)
         """
         super(ConvLSTMUNet, self).__init__()
         
@@ -161,13 +257,15 @@ class ConvLSTMUNet(nn.Module):
         self.hidden_channels = hidden_channels
         self.output_channels = output_channels
         self.kernel_size = kernel_size
+        self.use_attention = use_attention
         
         # Encoder: ConvLSTM layer
         self.encoder = ConvLSTMCell(
             input_dim=input_channels,
             hidden_dim=hidden_channels[0],
             kernel_size=kernel_size,
-            bias=True
+            bias=True,
+            use_group_norm=use_group_norm
         )
         
         # Downsampling layer
@@ -178,8 +276,13 @@ class ConvLSTMUNet(nn.Module):
             input_dim=hidden_channels[0],
             hidden_dim=hidden_channels[1],
             kernel_size=kernel_size,
-            bias=True
+            bias=True,
+            use_group_norm=use_group_norm
         )
+        
+        # Self-Attention at bottleneck (applied after bottleneck processing)
+        if use_attention:
+            self.attention = SelfAttention(in_channels=hidden_channels[1])
         
         # Upsampling layer (not used directly - see forward() for F.interpolate usage)
         # We use F.interpolate in forward() to handle odd spatial dimensions correctly
@@ -191,7 +294,8 @@ class ConvLSTMUNet(nn.Module):
             input_dim=hidden_channels[1] + hidden_channels[0],
             hidden_dim=hidden_channels[0],
             kernel_size=kernel_size,
-            bias=True
+            bias=True,
+            use_group_norm=use_group_norm
         )
         
         # Output head: 1x1 convolution to map to precipitation
@@ -246,6 +350,10 @@ class ConvLSTMUNet(nn.Module):
             
             # Bottleneck: Process through ConvLSTM at reduced resolution
             h_bot, c_bot = self.bottleneck(encoded_feat, (h_bot, c_bot))
+            
+            # Apply Self-Attention at bottleneck (captures global context at each timestep)
+            if self.use_attention:
+                h_bot = self.attention(h_bot)
         
         # Decoder: Upsample and apply skip connection
         # Upsample bottleneck output to match encoder output size
