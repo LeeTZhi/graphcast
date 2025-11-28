@@ -100,7 +100,7 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device):
         device: Device to load model on
         
     Returns:
-        Tuple of (model, checkpoint_data)
+        Tuple of (model, checkpoint_data, model_type)
     """
     checkpoint_path = Path(checkpoint_path)
     
@@ -119,6 +119,22 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device):
     arch = checkpoint['model_architecture']
     hidden_channels = arch['hidden_channels']
     
+    # Check if checkpoint has regularization layers by inspecting state_dict keys
+    state_dict = checkpoint['model_state_dict']
+    has_batch_norm = any('_bn' in key or 'batch_norm' in key for key in state_dict.keys())
+    has_dropout_layers = any('dropout' in key for key in state_dict.keys())
+    
+    # Get dropout rate from architecture or infer from state dict
+    dropout_rate = arch.get('dropout_rate', 0.0)
+    if dropout_rate == 0.0 and has_dropout_layers:
+        dropout_rate = 0.2  # Default if dropout layers exist but rate not saved
+    
+    print(f"Checkpoint analysis:")
+    print(f"  Hidden channels: {hidden_channels}")
+    print(f"  Has batch norm layers: {has_batch_norm}")
+    print(f"  Has dropout layers: {has_dropout_layers}")
+    print(f"  Dropout rate: {dropout_rate}")
+    
     # Detect model type based on number of hidden channel layers
     if len(hidden_channels) == 2:
         model_type = 'shallow'
@@ -130,19 +146,27 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device):
         )
     else:
         model_type = 'deep'
+        # Create model matching the checkpoint's architecture
         model = DeepConvLSTMUNet(
             input_channels=arch['input_channels'],
             hidden_channels=arch['hidden_channels'],
             output_channels=arch['output_channels'],
-            kernel_size=arch['kernel_size']
+            kernel_size=arch['kernel_size'],
+            dropout_rate=dropout_rate,
+            use_batch_norm=has_batch_norm,
+            use_spatial_dropout=arch.get('use_spatial_dropout', True)
         )
+        print(f"Created DeepConvLSTMUNet with:")
+        print(f"  dropout_rate={dropout_rate}")
+        print(f"  use_batch_norm={has_batch_norm}")
+        print(f"  use_spatial_dropout={arch.get('use_spatial_dropout', True)}")
     
-    # Load checkpoint
+    # Load checkpoint (use strict=False for backward compatibility)
     checkpoint_data = load_model_checkpoint(
         filepath=checkpoint_path,
         model=model,
         device=device,
-        strict=True
+        strict=False  # Allow loading old checkpoints without new layers
     )
     
     # Set to evaluation mode
@@ -195,6 +219,29 @@ def setup_logging(output_dir: Path, log_level: str = "INFO") -> logging.Logger:
     return logger
 
 
+def validate_date(date_str: str) -> bool:
+    """Validate if a date string is valid.
+    
+    Args:
+        date_str: Date string in ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+        
+    Returns:
+        True if valid, False otherwise
+    """
+    from datetime import datetime
+    
+    try:
+        # Try parsing with time
+        if 'T' in date_str:
+            datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        else:
+            # Try parsing date only
+            datetime.strptime(date_str, '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+
 def load_data(
     data_path: str, 
     logger: logging.Logger,
@@ -222,6 +269,30 @@ def load_data(
     
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
+    
+    # Validate dates before loading data
+    if start_time and not validate_date(start_time):
+        raise ValueError(
+            f"Invalid start_time: '{start_time}'. "
+            f"Please use valid ISO format (e.g., 2020-06-30T00:00:00). "
+            f"Note: June has only 30 days, not 31."
+        )
+    
+    if end_time and not validate_date(end_time):
+        raise ValueError(
+            f"Invalid end_time: '{end_time}'. "
+            f"Please use valid ISO format (e.g., 2020-06-30T23:00:00). "
+            f"Note: June has only 30 days, not 31."
+        )
+    
+    if specific_times:
+        for time_str in specific_times:
+            if not validate_date(time_str):
+                raise ValueError(
+                    f"Invalid time in specific_times: '{time_str}'. "
+                    f"Please use valid ISO format (e.g., 2020-06-30T12:00:00). "
+                    f"Note: June has only 30 days, not 31."
+                )
     
     logger.info(f"Loading data from {data_path}")
     
@@ -261,7 +332,12 @@ def load_data(
                 data = data.sel(time=slice(start_time, end_time))
                 logger.info(f"Filtered to {len(data.time)} timesteps")
             except Exception as e:
-                raise ValueError(f"Failed to filter time range: {e}")
+                available_times = [str(t) for t in data.time.values[:10]]
+                raise ValueError(
+                    f"Failed to filter time range: {e}\n"
+                    f"Available times (first 10): {available_times}\n"
+                    f"Hint: Check that your dates are valid and match the data format."
+                )
         
         if len(data.time) == 0:
             raise ValueError("No data remaining after time filtering")
