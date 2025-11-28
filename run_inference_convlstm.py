@@ -169,8 +169,31 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device):
         strict=False  # Allow loading old checkpoints without new layers
     )
     
+    # Ensure model is on the correct device (critical for CUDA)
+    model = model.to(device)
+    
+    # Verify all parameters are on correct device
+    param_devices = set()
+    for name, param in model.named_parameters():
+        param_devices.add(str(param.device))
+    
+    if len(param_devices) > 1:
+        print(f"WARNING: Model parameters are on multiple devices: {param_devices}")
+        print("Forcing all parameters to target device...")
+        model = model.to(device)
+    
     # Set to evaluation mode
     model.eval()
+    
+    # Final verification
+    model_device = next(model.parameters()).device
+    print(f"Model loaded on device: {model_device}")
+    if str(model_device) != str(device):
+        print(f"WARNING: Model device ({model_device}) != target device ({device})")
+        print("Attempting to fix...")
+        model = model.to(device)
+        model_device = next(model.parameters()).device
+        print(f"Model now on device: {model_device}")
     
     return model, checkpoint_data, model_type
 
