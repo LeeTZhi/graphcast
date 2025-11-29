@@ -39,6 +39,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import xarray as xr
 
@@ -589,35 +590,31 @@ def main():
         logger.info(f"  Upstream: lat=[{region_config.upstream_lat_min}, {region_config.upstream_lat_max}], "
                     f"lon=[{region_config.upstream_lon_min}, {region_config.upstream_lon_max}]")
     
-    # Split data into train/val/test
-    logger.info("Splitting data into train/val/test sets...")
-    try:
-        train_data, val_data, test_data = create_train_val_test_split(
-            data,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            trainval_end_date=args.trainval_end_date,
-            test_start_date=args.test_start_date
-        )
-        logger.info(f"Train: {len(train_data.time)} timesteps")
-        logger.info(f"Val: {len(val_data.time)} timesteps")
-        logger.info(f"Test: {len(test_data.time)} timesteps")
-        
-        # Log time ranges for each split
-        if len(train_data.time) > 0:
-            logger.info(f"Train time range: {train_data.time.values[0]} to {train_data.time.values[-1]}")
-        if len(val_data.time) > 0:
-            logger.info(f"Val time range: {val_data.time.values[0]} to {val_data.time.values[-1]}")
-        if len(test_data.time) > 0:
-            logger.info(f"Test time range: {test_data.time.values[0]} to {test_data.time.values[-1]}")
-            
-    except Exception as e:
-        logger.error(f"Failed to split data: {e}")
-        sys.exit(1)
-    
     # Create and fit normalizer (with caching)
+    # Note: We need to determine train/test split first to fit normalizer only on training data
     normalizer_path = output_dir / "normalizer.pkl"
     normalizer = ConvLSTMNormalizer()
+    
+    # Determine test cutoff for normalizer fitting
+    logger.info("Determining train/test split for normalization...")
+    times = data.time.values
+    
+    if args.trainval_end_date is not None:
+        test_cutoff = np.datetime64(args.trainval_end_date)
+        logger.info(f"Using trainval_end_date: {args.trainval_end_date}")
+    elif args.test_start_date is not None:
+        test_cutoff = np.datetime64(args.test_start_date)
+        logger.info(f"Using test_start_date: {args.test_start_date}")
+    else:
+        # Use ratio-based splitting
+        n_total = len(times)
+        n_trainval = int(n_total * (args.train_ratio + args.val_ratio))
+        test_cutoff = times[n_trainval]
+        logger.info(f"Using ratio-based split, test cutoff: {test_cutoff}")
+    
+    # Get trainval data for normalizer fitting
+    trainval_mask = times < test_cutoff
+    trainval_data_for_norm = data.isel(time=trainval_mask)
     
     # Check if normalizer already exists (from previous run or resume)
     if normalizer_path.exists():
@@ -632,30 +629,55 @@ def main():
             logger.warning(f"Failed to load cached normalizer: {e}")
             logger.info("Computing normalization statistics from scratch...")
             try:
-                normalizer.fit(train_data)
+                normalizer.fit(trainval_data_for_norm)
                 normalizer.save(str(normalizer_path))
                 logger.info(f"Normalizer saved to {normalizer_path}")
             except Exception as e:
                 logger.error(f"Failed to fit normalizer: {e}")
                 sys.exit(1)
     else:
-        logger.info("Computing normalization statistics...")
+        logger.info("Computing normalization statistics from train+val data...")
         try:
-            normalizer.fit(train_data)
+            normalizer.fit(trainval_data_for_norm)
             normalizer.save(str(normalizer_path))
             logger.info(f"Normalizer saved to {normalizer_path}")
         except Exception as e:
             logger.error(f"Failed to fit normalizer: {e}")
             sys.exit(1)
     
-    # Normalize data
-    logger.info("Normalizing data...")
+    # Normalize entire dataset BEFORE splitting
+    logger.info("Normalizing entire dataset (before splitting)...")
     try:
-        train_data_norm = normalizer.normalize(train_data)
-        val_data_norm = normalizer.normalize(val_data)
+        data_normalized = normalizer.normalize(data)
         logger.info("Data normalized successfully")
     except Exception as e:
         logger.error(f"Failed to normalize data: {e}")
+        sys.exit(1)
+    
+    # Split normalized data into train/val/test
+    logger.info("Splitting normalized data into train/val/test sets...")
+    try:
+        train_data_norm, val_data_norm, test_data_norm = create_train_val_test_split(
+            data_normalized,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            trainval_end_date=args.trainval_end_date,
+            test_start_date=args.test_start_date
+        )
+        logger.info(f"Train: {len(train_data_norm.time)} timesteps")
+        logger.info(f"Val: {len(val_data_norm.time)} timesteps")
+        logger.info(f"Test: {len(test_data_norm.time)} timesteps")
+        
+        # Log time ranges for each split
+        if len(train_data_norm.time) > 0:
+            logger.info(f"Train time range: {train_data_norm.time.values[0]} to {train_data_norm.time.values[-1]}")
+        if len(val_data_norm.time) > 0:
+            logger.info(f"Val time range: {val_data_norm.time.values[0]} to {val_data_norm.time.values[-1]}")
+        if len(test_data_norm.time) > 0:
+            logger.info(f"Test time range: {test_data_norm.time.values[0]} to {test_data_norm.time.values[-1]}")
+            
+    except Exception as e:
+        logger.error(f"Failed to split data: {e}")
         sys.exit(1)
     
     # Create datasets
