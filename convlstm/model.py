@@ -312,7 +312,7 @@ class ConvLSTMUNet(nn.Module):
         """Forward pass through the network.
         
         Args:
-            x: Input tensor [B, T, C, H, W]
+            x: Input tensor [B, T, C, H, W] or dict with 'downstream' key
                B = batch size
                T = time steps (default 6)
                C = channels (56)
@@ -325,7 +325,13 @@ class ConvLSTMUNet(nn.Module):
             This implementation handles odd spatial dimensions correctly by using
             F.interpolate with exact target size instead of fixed scale_factor.
             This prevents size mismatches when concatenating skip connections.
+            
+            If x is a dict (dual-stream mode), only uses 'downstream' key.
         """
+        # Handle dict input (dual-stream mode) - use only downstream
+        if isinstance(x, dict):
+            x = x['downstream']
+        
         batch_size, time_steps, channels, height, width = x.size()
         device = x.device
         

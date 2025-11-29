@@ -142,11 +142,18 @@ class DeepConvLSTMUNet(nn.Module):
         """Forward pass.
         
         Args:
-            x: Input [B, T, C, H, W]
+            x: Input [B, T, C, H, W] or dict with 'downstream' key
             
         Returns:
             Predicted precipitation [B, 1, H, W]
+            
+        Note:
+            If x is a dict (dual-stream mode), only uses 'downstream' key.
         """
+        # Handle dict input (dual-stream mode) - use only downstream
+        if isinstance(x, dict):
+            x = x['downstream']
+        
         batch_size, time_steps, channels, height, width = x.size()
         device = x.device
         
