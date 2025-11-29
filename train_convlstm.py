@@ -662,7 +662,8 @@ def main():
             train_ratio=args.train_ratio,
             val_ratio=args.val_ratio,
             trainval_end_date=args.trainval_end_date,
-            test_start_date=args.test_start_date
+            test_start_date=args.test_start_date,
+            random_trainval_split=False  # 使用时序划分，避免数据泄露
         )
         logger.info(f"Train: {len(train_data_norm.time)} timesteps")
         logger.info(f"Val: {len(val_data_norm.time)} timesteps")

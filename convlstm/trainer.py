@@ -335,8 +335,8 @@ class ConvLSTMTrainer:
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode='min',
-            factor=0.7,      # 改为0.7，每次衰减到原来的70%（更温和）
-            patience=10,     # 改为10，需要10个epoch没有改善才衰减（更宽容）
+            factor=0.9,      # 改为0.7，每次衰减到原来的70%（更温和）
+            patience=20,     # 改为10，需要10个epoch没有改善才衰减（更宽容）
             min_lr=1e-6,     # 添加最小学习率限制
             verbose=True
         )
