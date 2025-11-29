@@ -188,12 +188,17 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device):
     # Final verification
     model_device = next(model.parameters()).device
     print(f"Model loaded on device: {model_device}")
-    if str(model_device) != str(device):
-        print(f"WARNING: Model device ({model_device}) != target device ({device})")
+    
+    # Check device compatibility (handle mps vs mps:0 difference)
+    device_type_match = model_device.type == device.type
+    if not device_type_match:
+        print(f"WARNING: Model device type ({model_device.type}) != target device type ({device.type})")
         print("Attempting to fix...")
         model = model.to(device)
         model_device = next(model.parameters()).device
         print(f"Model now on device: {model_device}")
+    else:
+        print(f"✓ Model device type matches target: {device.type}")
     
     return model, checkpoint_data, model_type
 
@@ -270,16 +275,24 @@ def load_data(
     logger: logging.Logger,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
-    specific_times: Optional[List[str]] = None
+    specific_times: Optional[List[str]] = None,
+    window_size: Optional[int] = None,
+    target_offset: Optional[int] = None
 ) -> xr.Dataset:
     """Load xarray dataset from file with optional time filtering.
+    
+    When specific_times is provided with window_size, this function will automatically
+    load the required historical data (window_size timesteps before each target time)
+    to enable prediction.
     
     Args:
         data_path: Path to NetCDF data file
         logger: Logger instance
         start_time: Optional start time for filtering (ISO format)
         end_time: Optional end time for filtering (ISO format)
-        specific_times: Optional list of specific times to select (ISO format)
+        specific_times: Optional list of specific times to predict (ISO format)
+        window_size: Number of historical timesteps needed for input (e.g., 6)
+        target_offset: Number of timesteps ahead to predict (e.g., 1)
         
     Returns:
         Loaded xarray Dataset (potentially filtered by time)
@@ -329,26 +342,94 @@ def load_data(
         
         # Apply time filtering if specified
         if specific_times is not None:
-            logger.info(f"Filtering to specific times: {specific_times}")
-            try:
-                # Try exact match first
-                data = data.sel(time=specific_times)
-                logger.info(f"Selected {len(data.time)} specific timesteps")
-            except KeyError as e:
-                # If exact match fails, try nearest neighbor matching
-                logger.warning(f"Exact time match failed, trying nearest neighbor matching...")
-                try:
-                    data = data.sel(time=specific_times, method='nearest')
-                    logger.info(f"Selected {len(data.time)} timesteps using nearest matching")
-                    logger.info(f"Matched times: {[str(t) for t in data.time.values]}")
-                except Exception as e2:
-                    available_times = [str(t) for t in data.time.values[:10]]
-                    raise ValueError(
-                        f"Failed to select specific times. Error: {e}\n"
-                        f"Available times (first 10): {available_times}\n"
-                        f"Requested times: {specific_times}\n"
-                        f"Hint: Use format matching your data (e.g., 2019-05-08T02:00:00 or 2019-05-08T14:00:00)"
+            logger.info(f"Target prediction times: {specific_times}")
+            
+            # If window_size is provided, we need to load historical data
+            if window_size is not None:
+                logger.info(f"Auto-loading historical data (window_size={window_size})")
+                
+                # Convert specific_times to numpy datetime64 for easier manipulation
+                target_times = []
+                for time_str in specific_times:
+                    try:
+                        # Try exact match first
+                        matched_time = data.sel(time=time_str, method='nearest').time.values
+                        target_times.append(matched_time)
+                        logger.info(f"  Target time: {time_str} -> Matched: {matched_time}")
+                    except Exception as e:
+                        raise ValueError(
+                            f"Failed to find target time '{time_str}' in data. "
+                            f"Available times (first 10): {[str(t) for t in data.time.values[:10]]}"
+                        )
+                
+                # For each target time, find the required historical window
+                all_required_times = set()
+                
+                for target_time in target_times:
+                    # Find the index of target time
+                    target_idx = np.where(data.time.values == target_time)[0]
+                    
+                    if len(target_idx) == 0:
+                        raise ValueError(f"Target time {target_time} not found in data")
+                    
+                    target_idx = target_idx[0]
+                    
+                    # Calculate required historical window
+                    # We need window_size timesteps for input + target_offset for prediction
+                    # Total: window_size + target_offset timesteps
+                    total_needed = window_size + (target_offset if target_offset else 1)
+                    start_idx = target_idx - total_needed + 1
+                    
+                    if start_idx < 0:
+                        raise ValueError(
+                            f"Insufficient historical data for target time {target_time}. "
+                            f"Need {total_needed} timesteps (window_size={window_size} + target_offset={target_offset if target_offset else 1}), "
+                            f"but only {target_idx + 1} available. "
+                            f"First available time: {data.time.values[0]}"
+                        )
+                    
+                    # Add all required times (historical window + target)
+                    for idx in range(start_idx, target_idx + 1):
+                        all_required_times.add(data.time.values[idx])
+                    
+                    logger.info(
+                        f"  For target {target_time}: "
+                        f"loading {total_needed} timesteps from {data.time.values[start_idx]} "
+                        f"to {data.time.values[target_idx]} "
+                        f"(window_size={window_size} + target_offset={target_offset if target_offset else 1})"
                     )
+                
+                # Sort times and select from data
+                required_times_sorted = sorted(list(all_required_times))
+                logger.info(f"Total unique timesteps to load: {len(required_times_sorted)}")
+                logger.info(f"Time range: {required_times_sorted[0]} to {required_times_sorted[-1]}")
+                
+                # Select the required times
+                data = data.sel(time=required_times_sorted)
+                logger.info(f"Loaded {len(data.time)} timesteps for prediction")
+                
+            else:
+                # Original behavior: just select the specific times
+                logger.info(f"Filtering to specific times: {specific_times}")
+                try:
+                    # Try exact match first
+                    data = data.sel(time=specific_times)
+                    logger.info(f"Selected {len(data.time)} specific timesteps")
+                except KeyError as e:
+                    # If exact match fails, try nearest neighbor matching
+                    logger.warning(f"Exact time match failed, trying nearest neighbor matching...")
+                    try:
+                        data = data.sel(time=specific_times, method='nearest')
+                        logger.info(f"Selected {len(data.time)} timesteps using nearest matching")
+                        logger.info(f"Matched times: {[str(t) for t in data.time.values]}")
+                    except Exception as e2:
+                        available_times = [str(t) for t in data.time.values[:10]]
+                        raise ValueError(
+                            f"Failed to select specific times. Error: {e}\n"
+                            f"Available times (first 10): {available_times}\n"
+                            f"Requested times: {specific_times}\n"
+                            f"Hint: Use format matching your data (e.g., 2019-05-08T02:00:00 or 2019-05-08T14:00:00)"
+                        )
         elif start_time is not None or end_time is not None:
             logger.info(f"Filtering time range: {start_time} to {end_time}")
             try:
@@ -562,7 +643,10 @@ Examples:
         type=str,
         nargs='+',
         default=None,
-        help='Specific times to predict (ISO format: YYYY-MM-DDTHH:MM:SS)'
+        help='Specific target times to predict (ISO format: YYYY-MM-DDTHH:MM:SS). '
+             'Historical data (window_size timesteps) will be automatically loaded. '
+             'Example: --specific-times 2023-06-15T14:00:00 will load data from '
+             '2023-06-15T08:00:00 to 2023-06-15T14:00:00 (if window_size=6)'
     )
     
     # Comparison experiment
@@ -624,6 +708,18 @@ Examples:
         default=150,
         help='DPI for saved visualizations (default: 150)'
     )
+    viz_group.add_argument(
+        '--viz-vmin',
+        type=float,
+        default=0.0,
+        help='Minimum value for precipitation color scale (default: 0.0 mm)'
+    )
+    viz_group.add_argument(
+        '--viz-vmax',
+        type=float,
+        default=500.0,
+        help='Maximum value for precipitation color scale (default: 500.0 mm)'
+    )
     
     # Output options
     output_group = parser.add_argument_group('Output Options')
@@ -652,8 +748,8 @@ Examples:
         '--device',
         type=str,
         default='auto',
-        choices=['auto', 'cuda', 'cpu'],
-        help='Device to use for inference (default: auto)'
+        choices=['auto', 'cuda', 'mps', 'cpu'],
+        help='Device to use for inference (default: auto, mps for Apple Silicon Mac)'
     )
     device_group.add_argument(
         '--log-level',
@@ -706,7 +802,13 @@ def main():
     
     # Set device
     if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Auto-detect best available device
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
     else:
         device = torch.device(args.device)
     
@@ -714,6 +816,9 @@ def main():
     
     if device.type == 'cuda':
         logger.info(f"  GPU: {torch.cuda.get_device_name(0)}")
+    elif device.type == 'mps':
+        logger.info(f"  Apple Silicon GPU (MPS) detected")
+        logger.info(f"  Note: MPS provides GPU acceleration on Mac")
     
     # Load data
     try:
@@ -722,7 +827,9 @@ def main():
             logger=logger,
             start_time=args.start_time,
             end_time=args.end_time,
-            specific_times=args.specific_times
+            specific_times=args.specific_times,
+            window_size=args.window_size,
+            target_offset=args.target_offset
         )
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
@@ -894,32 +1001,31 @@ def main():
                 # Create side-by-side comparison: Ground Truth vs Prediction
                 fig, axes = plt.subplots(1, 2, figsize=(16, 6))
                 
-                # Get individual color scales for each subplot
+                # Get actual max values for display
                 truth_max = np.nanmax(truth.precipitation.values)
                 pred_max = np.nanmax(pred.precipitation.values)
                 
-                if truth_max == 0:
-                    truth_max = 1.0
-                if pred_max == 0:
-                    pred_max = 1.0
+                # Use unified color scale from command line arguments
+                vmin = args.viz_vmin
+                vmax = args.viz_vmax
                 
-                # Plot ground truth with its own color scale
+                # Plot ground truth with unified color scale
                 plot_precipitation_map(
                     precipitation=truth.precipitation,
-                    title=f"Ground Truth - {pred_time}\n(Max: {truth_max:.2f} mm)",
+                    title=f"Ground Truth - {pred_time}\n(Max: {truth_max:.2f} mm, Scale: {vmin}-{vmax} mm)",
                     ax=axes[0],
-                    vmin=0.0,
-                    vmax=truth_max,
+                    vmin=vmin,
+                    vmax=vmax,
                     show_colorbar=True
                 )
                 
-                # Plot prediction with its own color scale
+                # Plot prediction with unified color scale
                 plot_precipitation_map(
                     precipitation=pred.precipitation,
-                    title=f"Prediction - {pred_time}\n(Max: {pred_max:.2f} mm)",
+                    title=f"Prediction - {pred_time}\n(Max: {pred_max:.2f} mm, Scale: {vmin}-{vmax} mm)",
                     ax=axes[1],
-                    vmin=0.0,
-                    vmax=pred_max,
+                    vmin=vmin,
+                    vmax=vmax,
                     show_colorbar=True
                 )
                 

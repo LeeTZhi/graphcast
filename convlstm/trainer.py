@@ -410,7 +410,7 @@ class ConvLSTMTrainer:
         
         Args:
             batch: Tuple of (inputs, targets) or (inputs, targets, mask) from DataLoader
-                inputs: [B, T, C, H, W]
+                inputs: [B, T, C, H, W] or dict with 'downstream' and 'upstream' keys
                 targets: [B, H, W]
                 mask: [B, H, W] (optional, for masked loss)
         
@@ -425,7 +425,12 @@ class ConvLSTMTrainer:
             inputs, targets = batch
             mask = None
         
-        inputs = inputs.to(self.device)
+        # Move inputs to device (handle both tensor and dict)
+        if isinstance(inputs, dict):
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        else:
+            inputs = inputs.to(self.device)
+        
         targets = targets.to(self.device)
         
         # Forward pass with mixed precision
@@ -454,6 +459,7 @@ class ConvLSTMTrainer:
         
         Args:
             batch: Tuple of (inputs, targets) or (inputs, targets, mask) from DataLoader
+                inputs: [B, T, C, H, W] or dict with 'downstream' and 'upstream' keys
         
         Returns:
             Loss value for this batch
@@ -466,7 +472,12 @@ class ConvLSTMTrainer:
             inputs, targets = batch
             mask = None
         
-        inputs = inputs.to(self.device)
+        # Move inputs to device (handle both tensor and dict)
+        if isinstance(inputs, dict):
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        else:
+            inputs = inputs.to(self.device)
+        
         targets = targets.to(self.device)
         
         # Forward pass (no gradient computation)

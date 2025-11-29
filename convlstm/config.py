@@ -18,6 +18,10 @@ class ConvLSTMConfig:
         hidden_channels: List of hidden dimensions for encoder and bottleneck layers
         kernel_size: Size of convolutional kernel for ConvLSTM cells
         output_channels: Number of output channels (1 for precipitation)
+        model_type: Type of model ('unet', 'deep', 'dual_stream', 'dual_stream_deep')
+        use_attention: Whether to use self-attention at bottleneck
+        use_group_norm: Whether to use group normalization in ConvLSTM cells
+        dropout_rate: Dropout probability for regularization
         
         # Training hyperparameters
         learning_rate: Initial learning rate for AdamW optimizer
@@ -50,6 +54,10 @@ class ConvLSTMConfig:
     hidden_channels: List[int] = field(default_factory=lambda: [64, 128])  # Increased from [32, 64]
     kernel_size: int = 3
     output_channels: int = 1
+    model_type: str = 'dual_stream'  # 'unet', 'deep', 'dual_stream', 'dual_stream_deep'
+    use_attention: bool = True
+    use_group_norm: bool = True
+    dropout_rate: float = 0.0
     
     # Training hyperparameters
     learning_rate: float = 3e-4  # Reduced from 1e-3 for better stability
@@ -99,6 +107,12 @@ class ConvLSTMConfig:
         
         if self.output_channels <= 0:
             raise ValueError(f"output_channels must be positive, got {self.output_channels}")
+        
+        if self.model_type not in ['unet', 'deep', 'dual_stream', 'dual_stream_deep']:
+            raise ValueError(f"model_type must be one of ['unet', 'deep', 'dual_stream', 'dual_stream_deep'], got {self.model_type}")
+        
+        if self.dropout_rate < 0 or self.dropout_rate >= 1:
+            raise ValueError(f"dropout_rate must be in [0, 1), got {self.dropout_rate}")
         
         # Validate training hyperparameters
         if self.learning_rate <= 0:

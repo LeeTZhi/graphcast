@@ -896,20 +896,24 @@ class ConvLSTMDataset(Dataset):
         """Return number of valid sliding windows."""
         return self.num_windows
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         """Get one training sample with sliding window.
         
         Args:
             idx: Window index (0 to num_windows - 1).
             
         Returns:
-            Tuple of (input_tensor, target_tensor):
-            - input_tensor: Input sequence [T, C, H, W]
-              - T = window_size (e.g., 6)
-              - C = 56 channels
-              - H, W = spatial dimensions (concatenated if include_upstream=True)
-            - target_tensor: Target precipitation [H_down, W_down]
-              - H_down, W_down = downstream region spatial dimensions
+            If include_upstream=False:
+                Tuple of (input_tensor, target_tensor):
+                - input_tensor: Input sequence [T, C, H, W]
+                - target_tensor: Target precipitation [H_down, W_down]
+            
+            If include_upstream=True:
+                Tuple of (input_dict, target_tensor):
+                - input_dict: Dict with keys 'downstream' and 'upstream'
+                  - 'downstream': [T, C, H_down, W_down]
+                  - 'upstream': [T, C, H_up, W_up]
+                - target_tensor: Target precipitation [H_down, W_down]
               
         Raises:
             IndexError: If idx is out of range.
@@ -926,7 +930,9 @@ class ConvLSTMDataset(Dataset):
         
         # Create input sequence
         if self.include_upstream:
-            # Stack upstream and downstream regions spatially
+            # Return separate tensors for upstream and downstream
+            # They will be processed by separate encoder streams and fused at bottleneck
+            
             # Get upstream window
             upstream_window = stack_channels(
                 self.upstream_data,
@@ -939,12 +945,15 @@ class ConvLSTMDataset(Dataset):
                 time_slice=slice(start_time, end_time)
             )  # Shape: (T, C, H_down, W_down)
             
-            # Concatenate along longitude (width) dimension
-            # Upstream is west (left), downstream is east (right)
-            input_array = np.concatenate(
-                [upstream_window, downstream_window],
-                axis=3  # Concatenate along width dimension
-            )  # Shape: (T, C, H, W_up + W_down)
+            # Convert to PyTorch tensors
+            upstream_tensor = torch.from_numpy(upstream_window).float()
+            downstream_tensor = torch.from_numpy(downstream_window).float()
+            
+            # Return as dictionary for dual-stream processing
+            input_data = {
+                'downstream': downstream_tensor,
+                'upstream': upstream_tensor
+            }
             
         else:
             # Use only downstream region
@@ -952,14 +961,15 @@ class ConvLSTMDataset(Dataset):
                 self.downstream_data,
                 time_slice=slice(start_time, end_time)
             )  # Shape: (T, C, H_down, W_down)
+            
+            # Convert to PyTorch tensor
+            input_data = torch.from_numpy(input_array).float()
         
         # Get target (precipitation only, downstream region only)
         target_precip = self.downstream_data["precipitation"].isel(
             time=target_time
         ).values  # Shape: (H_down, W_down)
         
-        # Convert to PyTorch tensors
-        input_tensor = torch.from_numpy(input_array).float()
         target_tensor = torch.from_numpy(target_precip).float()
         
-        return input_tensor, target_tensor
+        return input_data, target_tensor

@@ -45,6 +45,8 @@ import xarray as xr
 
 from convlstm.model import ConvLSTMUNet, WeightedPrecipitationLoss
 from convlstm.model_deep import DeepConvLSTMUNet
+from convlstm.model_dual_stream import DualStreamConvLSTMUNet
+from convlstm.model_dual_stream_deep import DeepDualStreamConvLSTMUNet
 from convlstm.config import ConvLSTMConfig
 from convlstm.data import (
     ConvLSTMDataset,
@@ -257,9 +259,9 @@ Examples:
     model_group.add_argument(
         '--model-type',
         type=str,
-        default='shallow',
-        choices=['shallow', 'deep'],
-        help='Model architecture type: shallow (2 layers) or deep (4 layers) (default: shallow)'
+        default='dual_stream',
+        choices=['shallow', 'deep', 'dual_stream', 'dual_stream_deep'],
+        help='Model architecture type: shallow (2 layers), deep (4 layers), dual_stream (2 layers with dual-stream), or dual_stream_deep (4 layers with dual-stream) (default: dual_stream)'
     )
     model_group.add_argument(
         '--hidden-channels',
@@ -525,7 +527,9 @@ def main():
     if args.hidden_channels is None:
         if args.model_type == 'shallow':
             args.hidden_channels = [32, 64]
-        else:  # deep
+        elif args.model_type == 'dual_stream':
+            args.hidden_channels = [64, 128]
+        else:  # deep or dual_stream_deep
             args.hidden_channels = [64, 128, 256, 512]
     
     # Log configuration
@@ -751,7 +755,7 @@ def main():
             )
             logger.info(f"Shallow model features: attention={args.use_attention}, "
                        f"group_norm={args.use_group_norm}")
-        else:  # deep
+        elif args.model_type == 'deep':
             model = DeepConvLSTMUNet(
                 input_channels=config.input_channels,
                 hidden_channels=config.hidden_channels,
@@ -768,6 +772,32 @@ def main():
                        f"group_norm={args.use_group_norm}, "
                        f"spatial_dropout={args.use_spatial_dropout}, "
                        f"attention={args.use_attention}")
+        elif args.model_type == 'dual_stream':
+            model = DualStreamConvLSTMUNet(
+                input_channels=config.input_channels,
+                hidden_channels=config.hidden_channels,
+                output_channels=config.output_channels,
+                kernel_size=config.kernel_size,
+                use_attention=args.use_attention,
+                use_group_norm=args.use_group_norm,
+                dropout_rate=args.dropout_rate
+            )
+            logger.info(f"Dual-stream model features: attention={args.use_attention}, "
+                       f"group_norm={args.use_group_norm}, dropout={args.dropout_rate}")
+        elif args.model_type == 'dual_stream_deep':
+            model = DeepDualStreamConvLSTMUNet(
+                input_channels=config.input_channels,
+                hidden_channels=config.hidden_channels,
+                output_channels=config.output_channels,
+                kernel_size=config.kernel_size,
+                use_attention=args.use_attention,
+                use_group_norm=args.use_group_norm,
+                dropout_rate=args.dropout_rate
+            )
+            logger.info(f"Deep dual-stream model features: attention={args.use_attention}, "
+                       f"group_norm={args.use_group_norm}, dropout={args.dropout_rate}")
+        else:
+            raise ValueError(f"Unknown model_type: {args.model_type}")
         
         # Count parameters
         num_params = sum(p.numel() for p in model.parameters())
