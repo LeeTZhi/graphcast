@@ -50,6 +50,7 @@ class DeepDualStreamConvLSTMUNet(nn.Module):
         self.kernel_size = kernel_size
         self.num_levels = len(hidden_channels)
         self.use_attention = use_attention
+        self.use_group_norm = use_group_norm
         self.dropout_rate = dropout_rate
         
         # Downstream encoders

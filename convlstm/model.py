@@ -258,6 +258,7 @@ class ConvLSTMUNet(nn.Module):
         self.output_channels = output_channels
         self.kernel_size = kernel_size
         self.use_attention = use_attention
+        self.use_group_norm = use_group_norm
         
         # Encoder: ConvLSTM layer
         self.encoder = ConvLSTMCell(
