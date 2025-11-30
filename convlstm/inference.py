@@ -224,22 +224,23 @@ def predict_single(
             lon=slice(region_config.upstream_lon_min, region_config.upstream_lon_max)
         )
         
-        # Stack channels for both regions
+        # Stack channels for both regions (for dual-stream models)
         upstream_channels = stack_channels(upstream_data, time_slice=slice(None))
         downstream_channels = stack_channels(downstream_data, time_slice=slice(None))
         
-        # Concatenate along width dimension (upstream west, downstream east)
-        input_array = np.concatenate(
-            [upstream_channels, downstream_channels],
-            axis=3  # Width dimension
-        )
+        # Create dict input for dual-stream models
+        input_downstream = torch.from_numpy(downstream_channels).float().unsqueeze(0)  # [1, T, C, H, W]
+        input_upstream = torch.from_numpy(upstream_channels).float().unsqueeze(0)  # [1, T, C, H, W]
+        
+        input_tensor = {
+            'downstream': input_downstream.to(device),
+            'upstream': input_upstream.to(device)
+        }
     else:
         # Use only downstream region
         input_array = stack_channels(downstream_data, time_slice=slice(None))
-    
-    # Convert to tensor and add batch dimension
-    input_tensor = torch.from_numpy(input_array).float().unsqueeze(0)  # [1, T, C, H, W]
-    input_tensor = input_tensor.to(device)
+        input_tensor = torch.from_numpy(input_array).float().unsqueeze(0)  # [1, T, C, H, W]
+        input_tensor = input_tensor.to(device)
     
     # Run inference
     model.eval()
@@ -249,14 +250,8 @@ def predict_single(
     # Remove batch dimension
     prediction = prediction.squeeze(0)  # [1, H, W]
     
-    # If upstream was included, extract only the downstream region from prediction
-    # The model outputs the full spatial dimensions (upstream + downstream)
-    # but we only want the downstream portion
-    if include_upstream:
-        # Calculate the width of upstream region
-        upstream_width = len(upstream_data.lon)
-        # Extract downstream portion (right side of concatenated output)
-        prediction = prediction[:, :, upstream_width:]  # [1, H, W_down]
+    # Note: For dual-stream models, predictions are already downstream-only
+    # No need to extract region
     
     # Get coordinates for denormalization
     lat_coords = downstream_data.lat.values
@@ -392,6 +387,7 @@ def predict_batch(
                 
                 # Create input for this window
                 if include_upstream:
+                    # For dual-stream models, create separate tensors
                     upstream_window = stack_channels(
                         upstream_data,
                         time_slice=slice(start_time, end_time)
@@ -400,31 +396,42 @@ def predict_batch(
                         downstream_data,
                         time_slice=slice(start_time, end_time)
                     )
-                    input_array = np.concatenate(
-                        [upstream_window, downstream_window],
-                        axis=3
-                    )
+                    # Store as dict for dual-stream processing
+                    input_data_dict = {
+                        'downstream': downstream_window,
+                        'upstream': upstream_window
+                    }
+                    batch_inputs.append(input_data_dict)
                 else:
                     input_array = stack_channels(
                         downstream_data,
                         time_slice=slice(start_time, end_time)
                     )
-                
-                batch_inputs.append(input_array)
+                    batch_inputs.append(input_array)
             
-            # Stack into batch tensor
-            batch_tensor = torch.from_numpy(np.stack(batch_inputs, axis=0)).float()
-            batch_tensor = batch_tensor.to(device)  # [B, T, C, H, W]
+            # Prepare batch input
+            if include_upstream:
+                # Stack dict inputs into batch dict
+                batch_downstream = torch.from_numpy(
+                    np.stack([inp['downstream'] for inp in batch_inputs], axis=0)
+                ).float().to(device)
+                batch_upstream = torch.from_numpy(
+                    np.stack([inp['upstream'] for inp in batch_inputs], axis=0)
+                ).float().to(device)
+                batch_input = {
+                    'downstream': batch_downstream,
+                    'upstream': batch_upstream
+                }
+            else:
+                # Stack tensor inputs into batch tensor
+                batch_input = torch.from_numpy(np.stack(batch_inputs, axis=0)).float()
+                batch_input = batch_input.to(device)  # [B, T, C, H, W]
             
             # Run inference
-            batch_predictions = model(batch_tensor)  # [B, 1, H, W]
+            batch_predictions = model(batch_input)  # [B, 1, H, W]
             
-            # If upstream was included, extract only the downstream region from predictions
-            if include_upstream:
-                # Calculate the width of upstream region
-                upstream_width = len(upstream_data.lon)
-                # Extract downstream portion (right side of concatenated output)
-                batch_predictions = batch_predictions[:, :, :, upstream_width:]  # [B, 1, H, W_down]
+            # Note: For dual-stream models, predictions are already downstream-only
+            # No need to extract region
             
             # Move to CPU and store
             batch_predictions = batch_predictions.cpu()

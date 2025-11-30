@@ -107,7 +107,7 @@ class ConvLSTMCell(nn.Module):
     
     def __init__(self, input_dim: int, hidden_dim: int, 
                  kernel_size: int = 3, bias: bool = True,
-                 use_group_norm: bool = False):
+                 use_group_norm: bool = True):
         """Initialize ConvLSTMCell.
         
         Args:
@@ -115,7 +115,7 @@ class ConvLSTMCell(nn.Module):
             hidden_dim: Number of hidden state channels
             kernel_size: Size of convolutional kernel (default: 3)
             bias: Whether to use bias in convolutions (default: True)
-            use_group_norm: Whether to use Group Normalization (default: False)
+            use_group_norm: Whether to use Group Normalization (default: True)
         """
         super(ConvLSTMCell, self).__init__()
         
@@ -234,7 +234,7 @@ class ConvLSTMUNet(nn.Module):
                  output_channels: int = 1,
                  kernel_size: int = 3,
                  use_attention: bool = True,
-                 use_group_norm: bool = False):
+                 use_group_norm: bool = True):
         """Initialize ConvLSTMUNet.
         
         Args:
@@ -243,7 +243,7 @@ class ConvLSTMUNet(nn.Module):
             output_channels: Number of output channels (default: 1)
             kernel_size: Size of convolutional kernel (default: 3)
             use_attention: Whether to use self-attention at bottleneck (default: True)
-            use_group_norm: Whether to use Group Normalization in ConvLSTM cells (default: False)
+            use_group_norm: Whether to use Group Normalization in ConvLSTM cells (default: True)
         """
         super(ConvLSTMUNet, self).__init__()
         

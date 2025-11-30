@@ -90,6 +90,9 @@ def save_model_checkpoint(
             'kernel_size': model.kernel_size,
             'use_attention': getattr(model, 'use_attention', False),
             'use_group_norm': getattr(model, 'use_group_norm', False),
+            'dropout_rate': getattr(model, 'dropout_rate', 0.0),
+            'use_spatial_dropout': getattr(model, 'use_spatial_dropout', True),
+            'model_type': getattr(config, 'model_type', None) if config else None,
         }
     }
     

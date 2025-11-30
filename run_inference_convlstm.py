@@ -75,6 +75,8 @@ import xarray as xr
 
 from convlstm.model import ConvLSTMUNet
 from convlstm.model_deep import DeepConvLSTMUNet
+from convlstm.model_dual_stream import DualStreamConvLSTMUNet
+from convlstm.model_dual_stream_deep import DeepDualStreamConvLSTMUNet
 from convlstm.trainer import load_model_checkpoint
 from convlstm.inference import (
     load_normalizer,
@@ -92,12 +94,14 @@ from convlstm.visualization import (
 import numpy as np
 
 
-def load_trained_model_auto(checkpoint_path: str, device: torch.device):
+def load_trained_model_auto(checkpoint_path: str, device: torch.device, model_type_override: str = None):
     """Load trained model with automatic architecture detection.
     
     Args:
         checkpoint_path: Path to checkpoint file
         device: Device to load model on
+        model_type_override: Optional model type to override auto-detection
+                            (useful for old checkpoints without metadata)
         
     Returns:
         Tuple of (model, checkpoint_data, model_type)
@@ -124,29 +128,57 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device):
     has_batch_norm = any('_bn' in key or 'batch_norm' in key for key in state_dict.keys())
     has_dropout_layers = any('dropout' in key for key in state_dict.keys())
     
+    # Check if it's a dual-stream model by looking for upstream encoder layers
+    is_dual_stream = any('upstream_encoder' in key for key in state_dict.keys())
+    
     # Get dropout rate from architecture or infer from state dict
     dropout_rate = arch.get('dropout_rate', 0.0)
     if dropout_rate == 0.0 and has_dropout_layers:
         dropout_rate = 0.2  # Default if dropout layers exist but rate not saved
+    
+    # Get model type from architecture metadata (if available)
+    model_type = arch.get('model_type', None)
     
     print(f"Checkpoint analysis:")
     print(f"  Hidden channels: {hidden_channels}")
     print(f"  Has batch norm layers: {has_batch_norm}")
     print(f"  Has dropout layers: {has_dropout_layers}")
     print(f"  Dropout rate: {dropout_rate}")
+    print(f"  Is dual-stream: {is_dual_stream}")
+    print(f"  Model type (from metadata): {model_type}")
     
-    # Detect model type based on number of hidden channel layers
-    if len(hidden_channels) == 2:
-        model_type = 'shallow'
+    # Use override if provided
+    if model_type_override is not None:
+        print(f"  Model type (override): {model_type_override}")
+        model_type = model_type_override
+    
+    # Detect model type based on architecture
+    if model_type is None:
+        # Fallback: infer from structure
+        if is_dual_stream:
+            if len(hidden_channels) == 2:
+                model_type = 'dual_stream'
+            else:
+                model_type = 'dual_stream_deep'
+        else:
+            if len(hidden_channels) == 2:
+                model_type = 'shallow'
+            else:
+                model_type = 'deep'
+    
+    print(f"  Detected model type: {model_type}")
+    
+    # Create model based on detected type
+    if model_type == 'shallow':
         model = ConvLSTMUNet(
             input_channels=arch['input_channels'],
             hidden_channels=arch['hidden_channels'],
             output_channels=arch['output_channels'],
-            kernel_size=arch['kernel_size']
+            kernel_size=arch['kernel_size'],
+            use_attention=arch.get('use_attention', True),
+            use_group_norm=arch.get('use_group_norm', True)
         )
-    else:
-        model_type = 'deep'
-        # Create model matching the checkpoint's architecture
+    elif model_type == 'deep':
         model = DeepConvLSTMUNet(
             input_channels=arch['input_channels'],
             hidden_channels=arch['hidden_channels'],
@@ -154,12 +186,40 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device):
             kernel_size=arch['kernel_size'],
             dropout_rate=dropout_rate,
             use_batch_norm=has_batch_norm,
-            use_spatial_dropout=arch.get('use_spatial_dropout', True)
+            use_group_norm=arch.get('use_group_norm', True),
+            use_spatial_dropout=arch.get('use_spatial_dropout', True),
+            use_attention=arch.get('use_attention', True)
         )
-        print(f"Created DeepConvLSTMUNet with:")
-        print(f"  dropout_rate={dropout_rate}")
-        print(f"  use_batch_norm={has_batch_norm}")
-        print(f"  use_spatial_dropout={arch.get('use_spatial_dropout', True)}")
+        print(f"  Created DeepConvLSTMUNet with:")
+        print(f"    dropout_rate={dropout_rate}")
+        print(f"    use_batch_norm={has_batch_norm}")
+        print(f"    use_spatial_dropout={arch.get('use_spatial_dropout', True)}")
+    elif model_type == 'dual_stream':
+        model = DualStreamConvLSTMUNet(
+            input_channels=arch['input_channels'],
+            hidden_channels=arch['hidden_channels'],
+            output_channels=arch['output_channels'],
+            kernel_size=arch['kernel_size'],
+            use_attention=arch.get('use_attention', True),
+            use_group_norm=arch.get('use_group_norm', True),
+            dropout_rate=dropout_rate
+        )
+        print(f"  Created DualStreamConvLSTMUNet with:")
+        print(f"    dropout_rate={dropout_rate}")
+    elif model_type == 'dual_stream_deep':
+        model = DeepDualStreamConvLSTMUNet(
+            input_channels=arch['input_channels'],
+            hidden_channels=arch['hidden_channels'],
+            output_channels=arch['output_channels'],
+            kernel_size=arch['kernel_size'],
+            use_attention=arch.get('use_attention', True),
+            use_group_norm=arch.get('use_group_norm', True),
+            dropout_rate=dropout_rate
+        )
+        print(f"  Created DeepDualStreamConvLSTMUNet with:")
+        print(f"    dropout_rate={dropout_rate}")
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
     
     # Load checkpoint (use strict=False for backward compatibility)
     checkpoint_data = load_model_checkpoint(
@@ -507,6 +567,14 @@ Examples:
       --output-dir outputs/baseline \\
       --specific-times 2023-01-15T12:00:00 2023-02-15T12:00:00
 
+  # Inference with old checkpoint (manual model type specification)
+  python run_inference_convlstm.py \\
+      --checkpoint checkpoints/old_model.pt \\
+      --normalizer checkpoints/normalizer.pkl \\
+      --data data/test_data.nc \\
+      --output-dir outputs/old_model \\
+      --model-type dual_stream_deep
+
   # Compare two experiments
   python run_inference_convlstm.py \\
       --checkpoint checkpoints/baseline/best_model.pt \\
@@ -606,6 +674,14 @@ Examples:
     # Inference configuration
     inference_group = parser.add_argument_group('Inference Configuration')
     inference_group.add_argument(
+        '--model-type',
+        type=str,
+        default=None,
+        choices=['shallow', 'deep', 'dual_stream', 'dual_stream_deep'],
+        help='Model architecture type (optional, auto-detected from checkpoint if not specified). '
+             'Use this to override auto-detection for old checkpoints without model_type metadata.'
+    )
+    inference_group.add_argument(
         '--window-size',
         type=int,
         default=6,
@@ -667,6 +743,13 @@ Examples:
         '--compare-upstream',
         action='store_true',
         help='Second model uses upstream region'
+    )
+    comparison_group.add_argument(
+        '--compare-model-type',
+        type=str,
+        default=None,
+        choices=['shallow', 'deep', 'dual_stream', 'dual_stream_deep'],
+        help='Model type for comparison model (optional, auto-detected if not specified)'
     )
     comparison_group.add_argument(
         '--exp1-name',
@@ -856,14 +939,43 @@ def main():
     
     # Load model and normalizer
     logger.info("Loading model and normalizer...")
+    if args.model_type:
+        logger.info(f"Using manually specified model type: {args.model_type}")
     try:
-        model, checkpoint_data, model_type = load_trained_model_auto(args.checkpoint, device=device)
+        model, checkpoint_data, model_type = load_trained_model_auto(
+            args.checkpoint, 
+            device=device,
+            model_type_override=args.model_type
+        )
         normalizer = load_normalizer(args.normalizer)
         
         logger.info(f"Model type: {model_type}")
         logger.info(f"Model architecture: {checkpoint_data['model_architecture']}")
         logger.info(f"Model loaded from epoch {checkpoint_data['epoch']}")
         logger.info(f"Best validation loss: {checkpoint_data['best_val_loss']:.4f}")
+        
+        # Auto-detect if upstream region should be used
+        is_dual_stream_model = model_type in ['dual_stream', 'dual_stream_deep']
+        
+        if is_dual_stream_model and not args.include_upstream:
+            logger.warning("=" * 80)
+            logger.warning("IMPORTANT: Dual-stream model detected!")
+            logger.warning(f"  Model type: {model_type}")
+            logger.warning("  This model was trained with upstream region data.")
+            logger.warning("  Automatically enabling --include-upstream for inference.")
+            logger.warning("=" * 80)
+            args.include_upstream = True
+        elif not is_dual_stream_model and args.include_upstream:
+            logger.warning("=" * 80)
+            logger.warning("WARNING: Single-stream model detected!")
+            logger.warning(f"  Model type: {model_type}")
+            logger.warning("  This model was trained WITHOUT upstream region data.")
+            logger.warning("  The --include-upstream flag will be ignored.")
+            logger.warning("  Only downstream region will be used for prediction.")
+            logger.warning("=" * 80)
+            args.include_upstream = False
+        
+        logger.info(f"Using upstream region: {args.include_upstream}")
         
         # Count parameters
         num_params = sum(p.numel() for p in model.parameters())
@@ -877,8 +989,14 @@ def main():
     normalizer2 = None
     if args.compare_checkpoint:
         logger.info("Loading comparison model and normalizer...")
+        if args.compare_model_type:
+            logger.info(f"Using manually specified comparison model type: {args.compare_model_type}")
         try:
-            model2, checkpoint_data2, model_type2 = load_trained_model_auto(args.compare_checkpoint, device=device)
+            model2, checkpoint_data2, model_type2 = load_trained_model_auto(
+                args.compare_checkpoint, 
+                device=device,
+                model_type_override=args.compare_model_type
+            )
             normalizer2 = load_normalizer(args.compare_normalizer)
             
             logger.info(f"Comparison model type: {model_type2}")
