@@ -110,8 +110,12 @@ class TestConvLSTMUNet:
         # Check output shape
         assert output.shape == (batch_size, 1, height, width)
     
-    def test_model_forward_non_negative_output(self):
-        """Test ConvLSTMUNet produces non-negative outputs (ReLU activation)."""
+    def test_model_forward_output_range(self):
+        """Test ConvLSTMUNet produces outputs in reasonable range.
+        
+        Note: The model works with normalized data (log1p + Z-score), so outputs
+        can be negative. We just check that outputs are finite and reasonable.
+        """
         batch_size = 2
         time_steps = 6
         channels = 56
@@ -130,8 +134,12 @@ class TestConvLSTMUNet:
         # Forward pass
         output = model(x)
         
-        # Check all outputs are non-negative
-        assert torch.all(output >= 0)
+        # Check all outputs are finite (no NaN or Inf)
+        assert torch.all(torch.isfinite(output)), "Output contains NaN or Inf values"
+        
+        # Check outputs are in a reasonable range (normalized data typically in [-5, 5])
+        assert torch.all(output >= -10) and torch.all(output <= 10), \
+            f"Output out of reasonable range: min={output.min():.2f}, max={output.max():.2f}"
     
     def test_model_forward_different_spatial_sizes(self):
         """Test ConvLSTMUNet works with different spatial dimensions."""

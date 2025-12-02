@@ -33,19 +33,21 @@ class DeepConvLSTMUNet(nn.Module):
                  use_batch_norm: bool = False,
                  use_group_norm: bool = True,
                  use_spatial_dropout: bool = True,
-                 use_attention: bool = True):
+                 use_attention: bool = True,
+                 multi_variable: bool = False):
         """Initialize DeepConvLSTMUNet with regularization.
         
         Args:
             input_channels: Number of input channels (default: 56)
             hidden_channels: List of hidden dims [enc1, enc2, enc3, bottleneck] (default: [64, 128, 256, 512])
-            output_channels: Number of output channels (default: 1)
+            output_channels: Number of output channels (default: 1, ignored if multi_variable=True)
             kernel_size: Convolutional kernel size (default: 3)
             dropout_rate: Dropout probability (default: 0.2, set to 0 to disable)
             use_batch_norm: Whether to use batch normalization (default: False, not recommended)
             use_group_norm: Whether to use group normalization in ConvLSTM cells (default: True, recommended)
             use_spatial_dropout: Use spatial dropout instead of regular dropout (default: True)
             use_attention: Whether to use self-attention at bottleneck (default: True)
+            multi_variable: Whether to predict all variables (56 channels) or just precipitation (1 channel) (default: False)
         """
         super(DeepConvLSTMUNet, self).__init__()
         
@@ -57,7 +59,8 @@ class DeepConvLSTMUNet(nn.Module):
         
         self.input_channels = input_channels
         self.hidden_channels = hidden_channels
-        self.output_channels = output_channels
+        self.multi_variable = multi_variable
+        self.output_channels = 56 if multi_variable else output_channels
         self.kernel_size = kernel_size
         self.num_levels = len(hidden_channels)
         self.dropout_rate = dropout_rate
@@ -136,7 +139,7 @@ class DeepConvLSTMUNet(nn.Module):
                 ])
         
         # Output head
-        self.output_head = nn.Conv2d(hidden_channels[0], output_channels, kernel_size=1)
+        self.output_head = nn.Conv2d(hidden_channels[0], self.output_channels, kernel_size=1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.

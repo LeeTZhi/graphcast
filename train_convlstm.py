@@ -43,7 +43,7 @@ import numpy as np
 import torch
 import xarray as xr
 
-from convlstm.model import ConvLSTMUNet, WeightedPrecipitationLoss
+from convlstm.model import ConvLSTMUNet, WeightedPrecipitationLoss, MultiVariableLoss
 from convlstm.model_deep import DeepConvLSTMUNet
 from convlstm.model_dual_stream import DualStreamConvLSTMUNet
 from convlstm.model_dual_stream_deep import DeepDualStreamConvLSTMUNet
@@ -425,6 +425,26 @@ Examples:
         help='Weight multiplier for high precipitation events (default: 3.0)'
     )
     
+    # Multi-variable prediction
+    multi_var_group = parser.add_argument_group('Multi-Variable Prediction')
+    multi_var_group.add_argument(
+        '--multi-variable',
+        action='store_true',
+        help='Enable multi-variable prediction mode (predict all 56 channels instead of just precipitation)'
+    )
+    multi_var_group.add_argument(
+        '--precip-loss-weight',
+        type=float,
+        default=10.0,
+        help='Weight for precipitation loss vs atmospheric variables in multi-variable mode (default: 10.0)'
+    )
+    multi_var_group.add_argument(
+        '--max-rollout-steps',
+        type=int,
+        default=6,
+        help='Maximum number of steps for rolling forecast (default: 6)'
+    )
+    
     # Memory optimization
     memory_group = parser.add_argument_group('Memory Optimization')
     memory_group.add_argument(
@@ -538,6 +558,10 @@ def main():
     logger.info(f"  Output directory: {output_dir}")
     logger.info(f"  Model type: {args.model_type}")
     logger.info(f"  Include upstream: {args.include_upstream}")
+    logger.info(f"  Multi-variable mode: {args.multi_variable}")
+    if args.multi_variable:
+        logger.info(f"  Precipitation loss weight: {args.precip_loss_weight}")
+        logger.info(f"  Max rollout steps: {args.max_rollout_steps}")
     logger.info(f"  Hidden channels: {args.hidden_channels}")
     logger.info(f"  Self-attention: {args.use_attention}")
     logger.info(f"  Group normalization: {args.use_group_norm}")
@@ -693,7 +717,8 @@ def main():
             window_size=args.window_size,
             region_config=region_config,
             target_offset=args.target_offset,
-            include_upstream=args.include_upstream
+            include_upstream=args.include_upstream,
+            multi_variable=args.multi_variable
         )
         
         val_dataset = ConvLSTMDataset(
@@ -701,7 +726,8 @@ def main():
             window_size=args.window_size,
             region_config=region_config,
             target_offset=args.target_offset,
-            include_upstream=args.include_upstream
+            include_upstream=args.include_upstream,
+            multi_variable=args.multi_variable
         )
         
         logger.info(f"Train dataset: {len(train_dataset)} samples")
@@ -715,7 +741,7 @@ def main():
         input_channels=56,
         hidden_channels=args.hidden_channels,
         kernel_size=args.kernel_size,
-        output_channels=1,
+        output_channels=56 if args.multi_variable else 1,
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
@@ -730,7 +756,10 @@ def main():
         num_workers=args.num_workers,
         checkpoint_frequency=args.checkpoint_frequency,
         validation_frequency=args.validation_frequency,
-        early_stopping_patience=args.early_stopping_patience
+        early_stopping_patience=args.early_stopping_patience,
+        multi_variable=args.multi_variable,
+        precip_loss_weight=args.precip_loss_weight,
+        max_rollout_steps=args.max_rollout_steps
     )
     
     # Validate configuration
@@ -751,7 +780,8 @@ def main():
                 output_channels=config.output_channels,
                 kernel_size=config.kernel_size,
                 use_attention=args.use_attention,
-                use_group_norm=args.use_group_norm
+                use_group_norm=args.use_group_norm,
+                multi_variable=args.multi_variable
             )
             logger.info(f"Shallow model features: attention={args.use_attention}, "
                        f"group_norm={args.use_group_norm}")
@@ -765,7 +795,8 @@ def main():
                 use_batch_norm=args.use_batch_norm,
                 use_group_norm=args.use_group_norm,
                 use_spatial_dropout=args.use_spatial_dropout,
-                use_attention=args.use_attention
+                use_attention=args.use_attention,
+                multi_variable=args.multi_variable
             )
             logger.info(f"Deep model regularization: dropout={args.dropout_rate}, "
                        f"batch_norm={args.use_batch_norm}, "
@@ -780,7 +811,8 @@ def main():
                 kernel_size=config.kernel_size,
                 use_attention=args.use_attention,
                 use_group_norm=args.use_group_norm,
-                dropout_rate=args.dropout_rate
+                dropout_rate=args.dropout_rate,
+                multi_variable=args.multi_variable
             )
             logger.info(f"Dual-stream model features: attention={args.use_attention}, "
                        f"group_norm={args.use_group_norm}, dropout={args.dropout_rate}")
@@ -792,7 +824,8 @@ def main():
                 kernel_size=config.kernel_size,
                 use_attention=args.use_attention,
                 use_group_norm=args.use_group_norm,
-                dropout_rate=args.dropout_rate
+                dropout_rate=args.dropout_rate,
+                multi_variable=args.multi_variable
             )
             logger.info(f"Deep dual-stream model features: attention={args.use_attention}, "
                        f"group_norm={args.use_group_norm}, dropout={args.dropout_rate}")

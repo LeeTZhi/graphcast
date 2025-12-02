@@ -24,17 +24,19 @@ class DeepDualStreamConvLSTMUNet(nn.Module):
                  kernel_size: int = 3,
                  use_attention: bool = True,
                  use_group_norm: bool = True,
-                 dropout_rate: float = 0.2):
+                 dropout_rate: float = 0.2,
+                 multi_variable: bool = False):
         """Initialize DeepDualStreamConvLSTMUNet.
         
         Args:
             input_channels: Number of input channels (default: 56)
             hidden_channels: List of hidden dims [enc1, enc2, enc3, bottleneck] (default: [64, 128, 256, 512])
-            output_channels: Number of output channels (default: 1)
+            output_channels: Number of output channels (default: 1, ignored if multi_variable=True)
             kernel_size: Convolutional kernel size (default: 3)
             use_attention: Whether to use self-attention at bottleneck (default: True)
             use_group_norm: Whether to use group normalization (default: True)
             dropout_rate: Dropout probability (default: 0.2)
+            multi_variable: Whether to predict all variables (56 channels) or just precipitation (1 channel) (default: False)
         """
         super(DeepDualStreamConvLSTMUNet, self).__init__()
         
@@ -46,7 +48,8 @@ class DeepDualStreamConvLSTMUNet(nn.Module):
         
         self.input_channels = input_channels
         self.hidden_channels = hidden_channels
-        self.output_channels = output_channels
+        self.multi_variable = multi_variable
+        self.output_channels = 56 if multi_variable else output_channels
         self.kernel_size = kernel_size
         self.num_levels = len(hidden_channels)
         self.use_attention = use_attention
@@ -114,7 +117,7 @@ class DeepDualStreamConvLSTMUNet(nn.Module):
             ])
         
         # Output head
-        self.output_head = nn.Conv2d(hidden_channels[0], output_channels, kernel_size=1)
+        self.output_head = nn.Conv2d(hidden_channels[0], self.output_channels, kernel_size=1)
     
     def forward(self, x: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
         """Forward pass.

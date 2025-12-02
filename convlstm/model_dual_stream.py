@@ -40,17 +40,19 @@ class DualStreamConvLSTMUNet(nn.Module):
                  kernel_size: int = 3,
                  use_attention: bool = True,
                  use_group_norm: bool = True,
-                 dropout_rate: float = 0.0):
+                 dropout_rate: float = 0.0,
+                 multi_variable: bool = False):
         """Initialize DualStreamConvLSTMUNet.
         
         Args:
             input_channels: Number of input channels (default: 56)
             hidden_channels: List of hidden dims [enc, bottleneck] (default: [64, 128])
-            output_channels: Number of output channels (default: 1)
+            output_channels: Number of output channels (default: 1, ignored if multi_variable=True)
             kernel_size: Convolutional kernel size (default: 3)
             use_attention: Whether to use self-attention at bottleneck (default: True)
             use_group_norm: Whether to use group normalization (default: True)
             dropout_rate: Dropout probability (default: 0.0)
+            multi_variable: Whether to predict all variables (56 channels) or just precipitation (1 channel) (default: False)
         """
         super(DualStreamConvLSTMUNet, self).__init__()
         
@@ -62,7 +64,8 @@ class DualStreamConvLSTMUNet(nn.Module):
         
         self.input_channels = input_channels
         self.hidden_channels = hidden_channels
-        self.output_channels = output_channels
+        self.multi_variable = multi_variable
+        self.output_channels = 56 if multi_variable else output_channels
         self.kernel_size = kernel_size
         self.use_attention = use_attention
         self.use_group_norm = use_group_norm
@@ -128,7 +131,7 @@ class DualStreamConvLSTMUNet(nn.Module):
         # Output head
         self.output_head = nn.Conv2d(
             in_channels=hidden_channels[0],
-            out_channels=output_channels,
+            out_channels=self.output_channels,
             kernel_size=1
         )
     

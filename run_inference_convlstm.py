@@ -71,6 +71,7 @@ from typing import Optional, List
 
 import matplotlib.pyplot as plt
 import torch
+import torch.nn as nn
 import xarray as xr
 
 from convlstm.model import ConvLSTMUNet
@@ -83,6 +84,7 @@ from convlstm.inference import (
     predict_batch,
     predict_single
 )
+from convlstm.rolling_forecast import rolling_forecast
 from convlstm.data import RegionConfig
 from convlstm.visualization import (
     plot_precipitation_map,
@@ -136,11 +138,22 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device, model_ty
     if dropout_rate == 0.0 and has_dropout_layers:
         dropout_rate = 0.2  # Default if dropout layers exist but rate not saved
     
+    # Detect multi-variable mode from checkpoint
+    output_channels = arch.get('output_channels', 1)
+    multi_variable = arch.get('multi_variable', False)
+    
+    # Infer multi_variable from output_channels if not explicitly set (old checkpoints)
+    if 'multi_variable' not in arch:
+        multi_variable = (output_channels == 56)
+        print(f"  Checkpoint missing multi_variable flag, inferred from output_channels: multi_variable={multi_variable}")
+    
     # Get model type from architecture metadata (if available)
     model_type = arch.get('model_type', None)
     
     print(f"Checkpoint analysis:")
     print(f"  Hidden channels: {hidden_channels}")
+    print(f"  Output channels: {output_channels}")
+    print(f"  Multi-variable mode: {multi_variable}")
     print(f"  Has batch norm layers: {has_batch_norm}")
     print(f"  Has dropout layers: {has_dropout_layers}")
     print(f"  Dropout rate: {dropout_rate}")
@@ -176,8 +189,11 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device, model_ty
             output_channels=arch['output_channels'],
             kernel_size=arch['kernel_size'],
             use_attention=arch.get('use_attention', True),
-            use_group_norm=arch.get('use_group_norm', True)
+            use_group_norm=arch.get('use_group_norm', True),
+            multi_variable=multi_variable
         )
+        print(f"  Created ConvLSTMUNet with:")
+        print(f"    multi_variable={multi_variable}")
     elif model_type == 'deep':
         model = DeepConvLSTMUNet(
             input_channels=arch['input_channels'],
@@ -188,12 +204,14 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device, model_ty
             use_batch_norm=has_batch_norm,
             use_group_norm=arch.get('use_group_norm', True),
             use_spatial_dropout=arch.get('use_spatial_dropout', True),
-            use_attention=arch.get('use_attention', True)
+            use_attention=arch.get('use_attention', True),
+            multi_variable=multi_variable
         )
         print(f"  Created DeepConvLSTMUNet with:")
         print(f"    dropout_rate={dropout_rate}")
         print(f"    use_batch_norm={has_batch_norm}")
         print(f"    use_spatial_dropout={arch.get('use_spatial_dropout', True)}")
+        print(f"    multi_variable={multi_variable}")
     elif model_type == 'dual_stream':
         model = DualStreamConvLSTMUNet(
             input_channels=arch['input_channels'],
@@ -202,10 +220,12 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device, model_ty
             kernel_size=arch['kernel_size'],
             use_attention=arch.get('use_attention', True),
             use_group_norm=arch.get('use_group_norm', True),
-            dropout_rate=dropout_rate
+            dropout_rate=dropout_rate,
+            multi_variable=multi_variable
         )
         print(f"  Created DualStreamConvLSTMUNet with:")
         print(f"    dropout_rate={dropout_rate}")
+        print(f"    multi_variable={multi_variable}")
     elif model_type == 'dual_stream_deep':
         model = DeepDualStreamConvLSTMUNet(
             input_channels=arch['input_channels'],
@@ -214,10 +234,12 @@ def load_trained_model_auto(checkpoint_path: str, device: torch.device, model_ty
             kernel_size=arch['kernel_size'],
             use_attention=arch.get('use_attention', True),
             use_group_norm=arch.get('use_group_norm', True),
-            dropout_rate=dropout_rate
+            dropout_rate=dropout_rate,
+            multi_variable=multi_variable
         )
         print(f"  Created DeepDualStreamConvLSTMUNet with:")
         print(f"    dropout_rate={dropout_rate}")
+        print(f"    multi_variable={multi_variable}")
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
@@ -515,6 +537,177 @@ def load_data(
         raise ValueError(f"Failed to load data file: {e}")
 
 
+def generate_rolling_predictions(
+    model: nn.Module,
+    input_data: xr.Dataset,
+    normalizer,
+    region_config: RegionConfig,
+    window_size: int,
+    num_steps: int,
+    include_upstream: bool,
+    device: torch.device,
+    logger: logging.Logger
+) -> xr.Dataset:
+    """Generate rolling forecast predictions.
+    
+    Args:
+        model: Trained model in multi-variable mode
+        input_data: Input xarray dataset
+        normalizer: Data normalizer
+        region_config: Region configuration
+        window_size: Number of historical timesteps for input
+        num_steps: Number of steps to predict ahead
+        include_upstream: Whether to include upstream region
+        device: Device to run on
+        logger: Logger instance
+        
+    Returns:
+        xarray Dataset with multi-step predictions
+    """
+    from convlstm.data import stack_channels
+    
+    # Extract downstream region
+    downstream_data = input_data.sel(
+        lat=slice(region_config.downstream_lat_min, region_config.downstream_lat_max),
+        lon=slice(region_config.downstream_lon_min, region_config.downstream_lon_max)
+    )
+    
+    # Get spatial dimensions
+    lats = downstream_data.lat.values
+    lons = downstream_data.lon.values
+    
+    # Determine how many initial windows we can create
+    num_timesteps = len(input_data.time)
+    num_windows = num_timesteps - window_size + 1
+    
+    if num_windows <= 0:
+        raise ValueError(
+            f"Insufficient timesteps for rolling forecast. "
+            f"Need at least {window_size} timesteps, got {num_timesteps}"
+        )
+    
+    logger.info(f"Creating {num_windows} rolling forecast(s)")
+    
+    all_predictions = []
+    all_times = []
+    
+    # Generate rolling forecast for each possible starting window
+    for window_idx in range(num_windows):
+        start_idx = window_idx
+        end_idx = window_idx + window_size
+        
+        logger.info(f"Rolling forecast {window_idx + 1}/{num_windows}: "
+                   f"using timesteps {start_idx} to {end_idx - 1}")
+        
+        # Extract input window
+        window_data = downstream_data.isel(time=slice(start_idx, end_idx))
+        
+        # Normalize the window data
+        window_normalized = normalizer.normalize(window_data)
+        
+        # Stack channels
+        input_array = stack_channels(window_normalized)  # [T, C, H, W]
+        
+        # Convert to tensor and add batch dimension
+        input_tensor = torch.from_numpy(input_array).float()
+        input_tensor = input_tensor.unsqueeze(0)  # [1, T, C, H, W]
+        
+        # Perform rolling forecast
+        predictions_tensor = rolling_forecast(
+            model=model,
+            initial_input=input_tensor,
+            num_steps=num_steps,
+            device=device
+        )  # [1, num_steps, 56, H, W]
+        
+        # Remove batch dimension
+        predictions_tensor = predictions_tensor.squeeze(0)  # [num_steps, 56, H, W]
+        
+        # Move to CPU and convert to numpy
+        predictions_np = predictions_tensor.cpu().numpy()
+        
+        # Denormalize predictions
+        # For multi-variable: channels 0-54 are atmospheric, channel 55 is precipitation
+        pressure_levels = [1000, 925, 850, 700, 500, 400, 300, 250, 200, 150, 100]
+        var_names = ['DPT', 'GPH', 'TEM', 'U', 'V']
+        
+        for step_idx in range(num_steps):
+            for channel_idx in range(56):
+                if channel_idx == 55:
+                    # Precipitation channel
+                    mean = float(normalizer.mean['precipitation'].values)
+                    std = float(normalizer.std['precipitation'].values)
+                    # Denormalize
+                    predictions_np[step_idx, channel_idx] = (
+                        predictions_np[step_idx, channel_idx] * std + mean
+                    )
+                    # Reverse log1p transform
+                    predictions_np[step_idx, channel_idx] = np.expm1(
+                        predictions_np[step_idx, channel_idx]
+                    )
+                else:
+                    # Atmospheric variables
+                    var_idx = channel_idx // 11
+                    level_idx = channel_idx % 11
+                    var_name = var_names[var_idx]
+                    level = pressure_levels[level_idx]
+                    
+                    # Get mean and std for this variable and level
+                    mean = float(normalizer.mean[var_name].sel(level=level).values)
+                    std = float(normalizer.std[var_name].sel(level=level).values)
+                    
+                    # Denormalize
+                    predictions_np[step_idx, channel_idx] = (
+                        predictions_np[step_idx, channel_idx] * std + mean
+                    )
+        
+        # Store predictions for this window
+        all_predictions.append(predictions_np)
+        
+        # Calculate prediction times (relative to end of input window)
+        last_input_time = window_data.time.values[-1]
+        time_delta = window_data.time.values[1] - window_data.time.values[0]
+        
+        for step in range(num_steps):
+            pred_time = last_input_time + (step + 1) * time_delta
+            all_times.append(pred_time)
+    
+    # Stack all predictions
+    all_predictions = np.concatenate(all_predictions, axis=0)  # [total_preds, 56, H, W]
+    
+    # Create xarray Dataset with all variables
+    coords = {
+        'time': all_times,
+        'lat': lats,
+        'lon': lons
+    }
+    
+    # Extract precipitation (channel 55)
+    precipitation = all_predictions[:, 55, :, :]
+    
+    # Create dataset with precipitation
+    predictions_ds = xr.Dataset(
+        {
+            'precipitation': (['time', 'lat', 'lon'], precipitation)
+        },
+        coords=coords
+    )
+    
+    # Add atmospheric variables if needed for visualization
+    var_names = ['DPT', 'GPH', 'TEM', 'U', 'V']
+    pressure_levels = [1000, 925, 850, 700, 500, 400, 300, 250, 200, 150, 100]
+    
+    for var_idx, var_name in enumerate(var_names):
+        for level_idx, level in enumerate(pressure_levels):
+            channel_idx = var_idx * 11 + level_idx
+            var_data = all_predictions[:, channel_idx, :, :]
+            predictions_ds[f'{var_name}_{level}'] = (['time', 'lat', 'lon'], var_data)
+    
+    logger.info(f"Generated {len(all_times)} total predictions across {num_windows} window(s)")
+    
+    return predictions_ds
+
+
 def parse_args():
     """Parse command line arguments.
     
@@ -699,6 +892,13 @@ Examples:
         default=8,
         help='Batch size for inference (default: 8)'
     )
+    inference_group.add_argument(
+        '--rolling-steps',
+        type=int,
+        default=None,
+        help='Number of steps for rolling forecast (1-6). When enabled, performs autoregressive '
+             'multi-step prediction. Only supported for multi-variable models. (default: None, disabled)'
+    )
     
     # Time filtering
     time_group = parser.add_argument_group('Time Filtering')
@@ -872,6 +1072,9 @@ def main():
     logger.info(f"  Target offset: {args.target_offset}")
     logger.info(f"  Batch size: {args.batch_size}")
     
+    if args.rolling_steps:
+        logger.info(f"  Rolling forecast: {args.rolling_steps} steps")
+    
     if args.start_time or args.end_time:
         logger.info(f"  Time range: {args.start_time} to {args.end_time}")
     if args.specific_times:
@@ -980,6 +1183,42 @@ def main():
         # Count parameters
         num_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Model parameters: {num_params:,}")
+        
+        # Validate rolling forecast configuration
+        if args.rolling_steps:
+            # Check if model supports rolling forecast
+            output_channels = checkpoint_data['model_architecture'].get('output_channels', 1)
+            multi_variable = checkpoint_data['model_architecture'].get('multi_variable', False)
+            
+            if output_channels == 1 or not multi_variable:
+                logger.error("=" * 80)
+                logger.error("ERROR: Rolling forecast requires multi-variable mode!")
+                logger.error(f"  Model output channels: {output_channels}")
+                logger.error(f"  Model multi_variable: {multi_variable}")
+                logger.error("  Rolling forecast is only supported for models with 56 output channels.")
+                logger.error("  Please use a model trained with --multi_variable flag.")
+                logger.error("=" * 80)
+                sys.exit(1)
+            
+            if is_dual_stream_model:
+                logger.error("=" * 80)
+                logger.error("ERROR: Rolling forecast not supported for dual-stream models!")
+                logger.error(f"  Model type: {model_type}")
+                logger.error("  Dual-stream models require upstream data for future timesteps,")
+                logger.error("  which is not available during rolling prediction.")
+                logger.error("=" * 80)
+                sys.exit(1)
+            
+            if not (1 <= args.rolling_steps <= 6):
+                logger.error(f"ERROR: rolling_steps must be between 1 and 6, got {args.rolling_steps}")
+                sys.exit(1)
+            
+            logger.info("=" * 80)
+            logger.info("Rolling forecast mode enabled")
+            logger.info(f"  Number of steps: {args.rolling_steps}")
+            logger.info(f"  Model output channels: {output_channels}")
+            logger.info("=" * 80)
+        
     except Exception as e:
         logger.error(f"Failed to load model or normalizer: {e}")
         sys.exit(1)
@@ -1011,17 +1250,33 @@ def main():
     logger.info("=" * 80)
     
     try:
-        predictions = predict_batch(
-            model=model,
-            input_data=data,
-            normalizer=normalizer,
-            region_config=region_config,
-            window_size=args.window_size,
-            target_offset=args.target_offset,
-            include_upstream=args.include_upstream,
-            batch_size=args.batch_size,
-            device=device
-        )
+        if args.rolling_steps:
+            # Rolling forecast mode
+            logger.info("Using rolling forecast mode")
+            predictions = generate_rolling_predictions(
+                model=model,
+                input_data=data,
+                normalizer=normalizer,
+                region_config=region_config,
+                window_size=args.window_size,
+                num_steps=args.rolling_steps,
+                include_upstream=args.include_upstream,
+                device=device,
+                logger=logger
+            )
+        else:
+            # Standard single-step prediction
+            predictions = predict_batch(
+                model=model,
+                input_data=data,
+                normalizer=normalizer,
+                region_config=region_config,
+                window_size=args.window_size,
+                target_offset=args.target_offset,
+                include_upstream=args.include_upstream,
+                batch_size=args.batch_size,
+                device=device
+            )
         
         logger.info(f"Generated {len(predictions.time)} predictions")
         logger.info(f"Prediction shape: {predictions.precipitation.shape}")

@@ -108,10 +108,12 @@ def test_convlstm_unet():
     assert output.shape == (batch_size, 1, height, width)
     print(f"  ✓ Output shape correct: {output.shape}")
     
-    # Test 5: Non-negative output
-    print("Test 5: Non-negative output (ReLU)...")
-    assert torch.all(output >= 0)
-    print(f"  ✓ All outputs non-negative (min={output.min().item():.4f})")
+    # Test 5: Output range check
+    print("Test 5: Output range check...")
+    assert torch.all(torch.isfinite(output)), "Output contains NaN or Inf"
+    assert torch.all(output >= -10) and torch.all(output <= 10), \
+        f"Output out of reasonable range: min={output.min().item():.4f}, max={output.max().item():.4f}"
+    print(f"  ✓ Outputs in reasonable range (min={output.min().item():.4f}, max={output.max().item():.4f})")
     
     # Test 6: Different spatial sizes
     print("Test 6: Different spatial sizes...")

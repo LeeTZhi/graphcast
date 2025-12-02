@@ -37,6 +37,16 @@ class ConvLSTMConfig:
         # Loss function parameters
         high_precip_threshold: Precipitation threshold (mm) for high-weight events
         high_precip_weight: Weight multiplier for high precipitation events
+        extreme_precip_threshold: Precipitation threshold (mm) for extreme-weight events
+        extreme_precip_weight: Weight multiplier for extreme precipitation events
+        
+        # Multi-variable prediction
+        multi_variable: Enable multi-variable prediction (56 channels) vs single-variable (1 channel)
+        precip_loss_weight: Weight for precipitation loss vs atmospheric variables in multi-variable mode
+        
+        # Rolling forecast
+        max_rollout_steps: Maximum number of steps for rolling prediction
+        enable_rollout_training: Whether to train with rollout supervision
         
         # Memory optimization
         use_amp: Whether to use automatic mixed precision training
@@ -75,6 +85,14 @@ class ConvLSTMConfig:
     high_precip_weight: float = 5.0  # Increased from 3.0
     extreme_precip_threshold: float = 50.0  # mm - extreme precipitation
     extreme_precip_weight: float = 10.0  # New: higher weight for extreme events
+    
+    # Multi-variable prediction
+    multi_variable: bool = False  # Enable multi-variable prediction (56 channels) vs single-variable (1 channel)
+    precip_loss_weight: float = 10.0  # Weight for precipitation loss vs atmospheric variables in multi-variable mode
+    
+    # Rolling forecast
+    max_rollout_steps: int = 6  # Maximum number of steps for rolling prediction
+    enable_rollout_training: bool = False  # Whether to train with rollout supervision
     
     # Memory optimization
     use_amp: bool = True  # Automatic mixed precision
@@ -157,6 +175,20 @@ class ConvLSTMConfig:
                     f"extreme_precip_weight ({self.extreme_precip_weight}) must be >= "
                     f"high_precip_weight ({self.high_precip_weight})"
                 )
+        
+        # Validate multi-variable prediction parameters
+        if not isinstance(self.multi_variable, bool):
+            raise ValueError(f"multi_variable must be a boolean, got {type(self.multi_variable)}")
+        
+        if self.precip_loss_weight <= 0:
+            raise ValueError(f"precip_loss_weight must be positive, got {self.precip_loss_weight}")
+        
+        # Validate rolling forecast parameters
+        if self.max_rollout_steps <= 0:
+            raise ValueError(f"max_rollout_steps must be positive, got {self.max_rollout_steps}")
+        
+        if not isinstance(self.enable_rollout_training, bool):
+            raise ValueError(f"enable_rollout_training must be a boolean, got {type(self.enable_rollout_training)}")
         
         # Validate memory optimization
         if self.gradient_accumulation_steps <= 0:

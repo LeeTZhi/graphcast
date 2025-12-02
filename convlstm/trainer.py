@@ -211,11 +211,52 @@ def load_model_checkpoint(
                     f"but provided model has hidden_channels={model.hidden_channels}"
                 )
             
+            # Check output channels and multi-variable mode compatibility
+            checkpoint_output_channels = arch.get('output_channels', 1)
+            checkpoint_multi_variable = arch.get('multi_variable', False)
+            
+            # Detect mode from output channels if multi_variable flag not present (old checkpoints)
+            if 'multi_variable' not in arch:
+                checkpoint_multi_variable = (checkpoint_output_channels == 56)
+                logger.info(
+                    f"Checkpoint missing multi_variable flag, inferred from output_channels: "
+                    f"multi_variable={checkpoint_multi_variable}"
+                )
+            
+            # Validate output channels match
+            if checkpoint_output_channels != model.output_channels:
+                raise RuntimeError(
+                    f"Model architecture mismatch: checkpoint has "
+                    f"output_channels={checkpoint_output_channels} "
+                    f"(multi_variable={checkpoint_multi_variable}), "
+                    f"but provided model has output_channels={model.output_channels} "
+                    f"(multi_variable={getattr(model, 'multi_variable', False)}). "
+                    f"Cannot load checkpoint with different prediction mode."
+                )
+            
+            # Validate multi_variable mode matches
+            model_multi_variable = getattr(model, 'multi_variable', False)
+            if checkpoint_multi_variable != model_multi_variable:
+                raise RuntimeError(
+                    f"Model prediction mode mismatch: checkpoint is in "
+                    f"{'multi-variable' if checkpoint_multi_variable else 'single-variable'} mode "
+                    f"(output_channels={checkpoint_output_channels}), "
+                    f"but provided model is in "
+                    f"{'multi-variable' if model_multi_variable else 'single-variable'} mode "
+                    f"(output_channels={model.output_channels}). "
+                    f"Please ensure the model is initialized with the same prediction mode as the checkpoint."
+                )
+            
             logger.info(f"Model architecture validated: {arch}")
+            logger.info(
+                f"Prediction mode: {'multi-variable' if checkpoint_multi_variable else 'single-variable'} "
+                f"(output_channels={checkpoint_output_channels})"
+            )
         else:
             logger.warning(
                 "Checkpoint does not contain model_architecture metadata. "
-                "Skipping architecture validation."
+                "Skipping architecture validation. "
+                "Assuming single-variable mode (backward compatibility)."
             )
         
         # Load model state
@@ -344,6 +385,20 @@ class ConvLSTMTrainer:
             verbose=True
         )
         
+        # Setup logger first (needed for loss function initialization)
+        if logger is None:
+            self.logger = logging.getLogger(__name__)
+            self.logger.setLevel(logging.INFO)
+            if not self.logger.handlers:
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter(
+                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                )
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
+        else:
+            self.logger = logger
+        
         # Initialize loss function
         self.use_masked_loss = use_masked_loss
         self.filled_weight = filled_weight
@@ -357,37 +412,45 @@ class ConvLSTMTrainer:
             ).to(self.device)
             self.logger.info(f"Using masked loss with filled_weight={filled_weight}")
         else:
-            # Use standard weighted precipitation loss
-            lat_coords = None
-            if hasattr(region_config, 'downstream_lat_range'):
-                import numpy as np
-                lat_min, lat_max = region_config.downstream_lat_range
-                lat_coords = None
+            # Check if multi-variable mode is enabled
+            multi_variable = getattr(config, 'multi_variable', False)
             
-            self.loss_fn = WeightedPrecipitationLoss(
-                high_precip_threshold=config.high_precip_threshold,
-                high_precip_weight=config.high_precip_weight,
-                extreme_precip_threshold=getattr(config, 'extreme_precip_threshold', 50.0),
-                extreme_precip_weight=getattr(config, 'extreme_precip_weight', 10.0),
-                latitude_coords=lat_coords
-            ).to(self.device)
+            if multi_variable:
+                # Use multi-variable loss
+                from convlstm.model import MultiVariableLoss
+                lat_coords = None
+                if hasattr(region_config, 'downstream_lat_range'):
+                    import numpy as np
+                    lat_min, lat_max = region_config.downstream_lat_range
+                    lat_coords = None
+                
+                self.loss_fn = MultiVariableLoss(
+                    precip_loss_weight=getattr(config, 'precip_loss_weight', 10.0),
+                    high_precip_threshold=config.high_precip_threshold,
+                    high_precip_weight=config.high_precip_weight,
+                    extreme_precip_threshold=getattr(config, 'extreme_precip_threshold', 50.0),
+                    extreme_precip_weight=getattr(config, 'extreme_precip_weight', 10.0),
+                    latitude_coords=lat_coords
+                ).to(self.device)
+                self.logger.info(f"Using multi-variable loss with precip_weight={getattr(config, 'precip_loss_weight', 10.0)}")
+            else:
+                # Use standard weighted precipitation loss
+                lat_coords = None
+                if hasattr(region_config, 'downstream_lat_range'):
+                    import numpy as np
+                    lat_min, lat_max = region_config.downstream_lat_range
+                    lat_coords = None
+                
+                self.loss_fn = WeightedPrecipitationLoss(
+                    high_precip_threshold=config.high_precip_threshold,
+                    high_precip_weight=config.high_precip_weight,
+                    extreme_precip_threshold=getattr(config, 'extreme_precip_threshold', 50.0),
+                    extreme_precip_weight=getattr(config, 'extreme_precip_weight', 10.0),
+                    latitude_coords=lat_coords
+                ).to(self.device)
         
         # Initialize GradScaler for mixed precision training
         self.scaler = GradScaler(enabled=config.use_amp)
-        
-        # Setup logger
-        if logger is None:
-            self.logger = logging.getLogger(__name__)
-            self.logger.setLevel(logging.INFO)
-            if not self.logger.handlers:
-                handler = logging.StreamHandler()
-                formatter = logging.Formatter(
-                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-                )
-                handler.setFormatter(formatter)
-                self.logger.addHandler(handler)
-        else:
-            self.logger = logger
         
         # Training state
         self.current_epoch = 0
@@ -408,14 +471,31 @@ class ConvLSTMTrainer:
         self.logger.info(f"Mixed precision training: {config.use_amp}")
         self.logger.info(f"Gradient accumulation steps: {config.gradient_accumulation_steps}")
     
-    def train_step(self, batch: tuple) -> float:
+    def train_step(self, batch: tuple) -> Union[float, Dict[str, float]]:
         """Execute one training step.
         
         Args:
             batch: Tuple of (inputs, targets) or (inputs, targets, mask) from DataLoader
                 inputs: [B, T, C, H, W] or dict with 'downstream' and 'upstream' keys
-                targets: [B, H, W]
+                targets: [B, H, W] for single-step or [B, num_steps, 56, H, W] for rolling
                 mask: [B, H, W] (optional, for masked loss)
+        
+        Returns:
+            Loss value for this batch, or dict with per-timestep losses for rolling mode
+        """
+        # Check if rolling training is enabled
+        enable_rollout = getattr(self.config, 'enable_rollout_training', False)
+        
+        if enable_rollout:
+            return self._train_step_rolling(batch)
+        else:
+            return self._train_step_standard(batch)
+    
+    def _train_step_standard(self, batch: tuple) -> float:
+        """Execute standard (non-rolling) training step.
+        
+        Args:
+            batch: Tuple of (inputs, targets) or (inputs, targets, mask) from DataLoader
         
         Returns:
             Loss value for this batch
@@ -456,6 +536,103 @@ class ConvLSTMTrainer:
         
         # Return unscaled loss for logging
         return loss.item() * self.config.gradient_accumulation_steps
+    
+    def _train_step_rolling(self, batch: tuple) -> Dict[str, float]:
+        """Execute rolling forecast training step with autoregressive prediction.
+        
+        This implements autoregressive training where each predicted timestep feeds
+        into the next prediction. Loss is accumulated across all timesteps.
+        
+        Args:
+            batch: Tuple of (inputs, targets) or (inputs, targets, mask) from DataLoader
+                inputs: [B, T, C, H, W] - initial input window
+                targets: [B, num_steps, 56, H, W] - multi-step targets
+        
+        Returns:
+            Dictionary with 'total' loss and per-timestep losses
+        """
+        # Handle both masked and unmasked batches
+        if len(batch) == 3:
+            inputs, targets, mask = batch
+            mask = mask.to(self.device)
+        else:
+            inputs, targets = batch
+            mask = None
+        
+        # Move inputs to device (handle both tensor and dict)
+        if isinstance(inputs, dict):
+            # Rolling forecast not supported for dual-stream yet
+            raise NotImplementedError(
+                "Rolling forecast training is not yet supported for dual-stream mode"
+            )
+        else:
+            inputs = inputs.to(self.device)
+        
+        targets = targets.to(self.device)
+        
+        # Get dimensions
+        batch_size, window_size, input_channels, height, width = inputs.size()
+        
+        # targets should be [B, num_steps, 56, H, W]
+        if len(targets.shape) == 4:
+            # Single-step targets [B, 56, H, W] - add timestep dimension
+            targets = targets.unsqueeze(1)
+        
+        num_steps = targets.size(1)
+        
+        # Initialize current input window
+        current_input = inputs
+        
+        # Collect per-timestep losses
+        timestep_losses = []
+        total_loss = 0.0
+        
+        # Autoregressive training loop
+        with autocast(enabled=self.config.use_amp):
+            for step in range(num_steps):
+                # Predict next timestep
+                predictions = self.model(current_input)  # [B, C_out, H, W]
+                
+                # Get target for this timestep
+                target_step = targets[:, step, :, :, :]  # [B, 56, H, W]
+                
+                # Compute loss for this timestep
+                if self.use_masked_loss and mask is not None:
+                    loss_dict = self.loss_fn(predictions, target_step, mask)
+                    step_loss = loss_dict['total']
+                else:
+                    step_loss = self.loss_fn(predictions, target_step)
+                
+                timestep_losses.append(step_loss.item())
+                total_loss = total_loss + step_loss
+                
+                # Update input window for next prediction (autoregressive)
+                # Shift window: remove oldest timestep, append prediction
+                pred_expanded = predictions.unsqueeze(1)  # [B, 1, C_out, H, W]
+                current_input = torch.cat([
+                    current_input[:, 1:, :, :, :],  # [B, T-1, C, H, W]
+                    pred_expanded  # [B, 1, C_out, H, W]
+                ], dim=1)  # [B, T, C, H, W]
+            
+            # Average loss across timesteps
+            total_loss = total_loss / num_steps
+            
+            # Scale loss for gradient accumulation
+            total_loss = total_loss / self.config.gradient_accumulation_steps
+        
+        # Backward pass through entire autoregressive sequence
+        self.scaler.scale(total_loss).backward()
+        
+        # Return unscaled losses for logging
+        result = {
+            'total': total_loss.item() * self.config.gradient_accumulation_steps,
+        }
+        
+        # Add per-timestep losses
+        for i, loss_val in enumerate(timestep_losses):
+            result[f'step_{i+1}'] = loss_val
+        
+        return result
     
     def validation_step(self, batch: tuple) -> float:
         """Execute one validation step.
@@ -511,12 +688,36 @@ class ConvLSTMTrainer:
         epoch_loss = 0.0
         num_batches = 0
         
+        # Check if rolling training is enabled
+        enable_rollout = getattr(self.config, 'enable_rollout_training', False)
+        
+        # For rolling mode, track per-timestep losses
+        if enable_rollout:
+            timestep_losses = {}
+        
         self.optimizer.zero_grad()
         
         for batch_idx, batch in enumerate(train_loader):
             # Training step
-            loss = self.train_step(batch)
-            epoch_loss += loss
+            loss_result = self.train_step(batch)
+            
+            # Handle both single loss value and dict of losses
+            if isinstance(loss_result, dict):
+                # Rolling mode - extract total loss and accumulate per-timestep losses
+                loss = loss_result['total']
+                epoch_loss += loss
+                
+                # Accumulate per-timestep losses
+                for key, value in loss_result.items():
+                    if key.startswith('step_'):
+                        if key not in timestep_losses:
+                            timestep_losses[key] = 0.0
+                        timestep_losses[key] += value
+            else:
+                # Standard mode - single loss value
+                loss = loss_result
+                epoch_loss += loss
+            
             num_batches += 1
             
             # Update weights after accumulation steps
@@ -538,9 +739,19 @@ class ConvLSTMTrainer:
             # Validation at specified frequency
             if val_loader is not None and self.global_step % self.config.validation_frequency == 0:
                 val_loss = self.validate(val_loader)
-                self.logger.info(
-                    f"Step {self.global_step}: train_loss={loss:.4f}, val_loss={val_loss:.4f}"
-                )
+                
+                # Log with per-timestep losses if rolling mode
+                if enable_rollout and isinstance(loss_result, dict):
+                    log_msg = f"Step {self.global_step}: train_loss={loss:.4f}, val_loss={val_loss:.4f}"
+                    # Add per-timestep losses
+                    for key in sorted([k for k in loss_result.keys() if k.startswith('step_')]):
+                        log_msg += f", {key}={loss_result[key]:.4f}"
+                    self.logger.info(log_msg)
+                else:
+                    self.logger.info(
+                        f"Step {self.global_step}: train_loss={loss:.4f}, val_loss={val_loss:.4f}"
+                    )
+                
                 self.model.train()  # Switch back to training mode
         
         # Handle remaining gradients if batch count is not divisible by accumulation steps
@@ -561,10 +772,17 @@ class ConvLSTMTrainer:
         
         avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
         
-        return {
+        result = {
             'train_loss': avg_loss,
             'num_batches': num_batches
         }
+        
+        # Add average per-timestep losses for rolling mode
+        if enable_rollout and timestep_losses:
+            for key, value in timestep_losses.items():
+                result[key] = value / num_batches
+        
+        return result
     
     def validate(self, val_loader: DataLoader) -> float:
         """Run validation.
@@ -678,6 +896,15 @@ class ConvLSTMTrainer:
             history['train_loss'].append(train_metrics['train_loss'])
             history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
             
+            # Record per-timestep losses if rolling mode
+            enable_rollout = getattr(self.config, 'enable_rollout_training', False)
+            if enable_rollout:
+                for key, value in train_metrics.items():
+                    if key.startswith('step_'):
+                        if key not in history:
+                            history[key] = []
+                        history[key].append(value)
+            
             # Logging
             epoch_time = time.time() - epoch_start_time
             log_msg = f"Epoch {epoch + 1}/{self.config.num_epochs}: "
@@ -686,6 +913,14 @@ class ConvLSTMTrainer:
                 log_msg += f", val_loss={val_loss:.4f}"
             log_msg += f", lr={self.optimizer.param_groups[0]['lr']:.6f}"
             log_msg += f", time={epoch_time:.2f}s"
+            
+            # Add per-timestep losses to log if rolling mode
+            if enable_rollout:
+                timestep_keys = sorted([k for k in train_metrics.keys() if k.startswith('step_')])
+                if timestep_keys:
+                    log_msg += " | Per-step: "
+                    log_msg += ", ".join([f"{k}={train_metrics[k]:.4f}" for k in timestep_keys])
+            
             self.logger.info(log_msg)
             
             # Periodic checkpointing
@@ -754,6 +989,7 @@ class ConvLSTMTrainer:
                 'kernel_size': self.model.kernel_size,
                 'use_attention': getattr(self.model, 'use_attention', False),
                 'use_group_norm': getattr(self.model, 'use_group_norm', False),
+                'multi_variable': getattr(self.model, 'multi_variable', False),
             }
         }
         
@@ -815,11 +1051,52 @@ class ConvLSTMTrainer:
                     f"but current model has hidden_channels={self.model.hidden_channels}"
                 )
             
+            # Check output channels and multi-variable mode compatibility
+            checkpoint_output_channels = arch.get('output_channels', 1)
+            checkpoint_multi_variable = arch.get('multi_variable', False)
+            
+            # Detect mode from output channels if multi_variable flag not present (old checkpoints)
+            if 'multi_variable' not in arch:
+                checkpoint_multi_variable = (checkpoint_output_channels == 56)
+                self.logger.info(
+                    f"Checkpoint missing multi_variable flag, inferred from output_channels: "
+                    f"multi_variable={checkpoint_multi_variable}"
+                )
+            
+            # Validate output channels match
+            if checkpoint_output_channels != self.model.output_channels:
+                raise RuntimeError(
+                    f"Model architecture mismatch: checkpoint has "
+                    f"output_channels={checkpoint_output_channels} "
+                    f"(multi_variable={checkpoint_multi_variable}), "
+                    f"but current model has output_channels={self.model.output_channels} "
+                    f"(multi_variable={getattr(self.model, 'multi_variable', False)}). "
+                    f"Cannot load checkpoint with different prediction mode."
+                )
+            
+            # Validate multi_variable mode matches
+            model_multi_variable = getattr(self.model, 'multi_variable', False)
+            if checkpoint_multi_variable != model_multi_variable:
+                raise RuntimeError(
+                    f"Model prediction mode mismatch: checkpoint is in "
+                    f"{'multi-variable' if checkpoint_multi_variable else 'single-variable'} mode "
+                    f"(output_channels={checkpoint_output_channels}), "
+                    f"but current model is in "
+                    f"{'multi-variable' if model_multi_variable else 'single-variable'} mode "
+                    f"(output_channels={self.model.output_channels}). "
+                    f"Please ensure the model is initialized with the same prediction mode as the checkpoint."
+                )
+            
             self.logger.info(f"Model architecture validated: {arch}")
+            self.logger.info(
+                f"Prediction mode: {'multi-variable' if checkpoint_multi_variable else 'single-variable'} "
+                f"(output_channels={checkpoint_output_channels})"
+            )
         else:
             self.logger.warning(
                 "Checkpoint does not contain model_architecture metadata. "
-                "Skipping architecture validation."
+                "Skipping architecture validation. "
+                "Assuming single-variable mode (backward compatibility)."
             )
         
         # Load model state

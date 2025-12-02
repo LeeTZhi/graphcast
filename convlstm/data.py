@@ -766,7 +766,8 @@ class ConvLSTMDataset(Dataset):
     
     This dataset wraps xarray data and generates sliding window samples for
     time series prediction. Supports optional upstream region inclusion for
-    comparative experiments.
+    comparative experiments, multi-variable prediction (all atmospheric variables
+    plus precipitation), and multi-step target sequences for rolling forecast training.
     
     Attributes:
         data: Normalized xarray Dataset with atmospheric and precipitation data.
@@ -774,6 +775,8 @@ class ConvLSTMDataset(Dataset):
         target_offset: Number of timesteps ahead to predict (default: 1).
         region_config: Region boundaries for upstream and downstream areas.
         include_upstream: Whether to include upstream region in input.
+        multi_variable: Whether to return multi-variable targets (56 channels).
+        num_target_steps: Number of future timesteps in target sequence.
     """
     
     def __init__(
@@ -782,7 +785,9 @@ class ConvLSTMDataset(Dataset):
         window_size: int,
         region_config: RegionConfig,
         target_offset: int = 1,
-        include_upstream: bool = False
+        include_upstream: bool = False,
+        multi_variable: bool = False,
+        num_target_steps: int = 1
     ):
         """Initialize ConvLSTMDataset.
         
@@ -792,6 +797,10 @@ class ConvLSTMDataset(Dataset):
             region_config: RegionConfig defining upstream and downstream boundaries.
             target_offset: Number of timesteps ahead to predict (default: 1).
             include_upstream: Whether to concatenate upstream region (default: False).
+            multi_variable: Whether to return multi-variable targets (56 channels) 
+                          instead of precipitation only (default: False).
+            num_target_steps: Number of future timesteps to include in target sequence
+                            for rolling forecast training (default: 1).
             
         Raises:
             ValueError: If data has insufficient timesteps or invalid dimensions.
@@ -801,24 +810,28 @@ class ConvLSTMDataset(Dataset):
         self.target_offset = target_offset
         self.region_config = region_config
         self.include_upstream = include_upstream
+        self.multi_variable = multi_variable
+        self.num_target_steps = num_target_steps
         
         # Validate data has sufficient timesteps
         num_timesteps = len(data.time)
-        min_required = window_size + target_offset
+        min_required = window_size + target_offset + num_target_steps - 1
         
         if num_timesteps < min_required:
             raise ValueError(
                 f"Dataset has {num_timesteps} timesteps, but requires at least "
-                f"{min_required} (window_size={window_size} + target_offset={target_offset})"
+                f"{min_required} (window_size={window_size} + target_offset={target_offset} "
+                f"+ num_target_steps={num_target_steps} - 1)"
             )
         
         # Calculate number of valid windows
-        self.num_windows = num_timesteps - window_size - target_offset + 1
+        self.num_windows = num_timesteps - window_size - target_offset - num_target_steps + 2
         
         if self.num_windows <= 0:
             raise ValueError(
                 f"No valid windows can be created. Dataset has {num_timesteps} timesteps, "
-                f"window_size={window_size}, target_offset={target_offset}"
+                f"window_size={window_size}, target_offset={target_offset}, "
+                f"num_target_steps={num_target_steps}"
             )
         
         # Extract region data
@@ -826,7 +839,8 @@ class ConvLSTMDataset(Dataset):
         
         logger.info(
             f"ConvLSTMDataset initialized: {self.num_windows} windows, "
-            f"window_size={window_size}, include_upstream={include_upstream}"
+            f"window_size={window_size}, include_upstream={include_upstream}, "
+            f"multi_variable={multi_variable}, num_target_steps={num_target_steps}"
         )
     
     def _extract_regions(self):
@@ -906,14 +920,18 @@ class ConvLSTMDataset(Dataset):
             If include_upstream=False:
                 Tuple of (input_tensor, target_tensor):
                 - input_tensor: Input sequence [T, C, H, W]
-                - target_tensor: Target precipitation [H_down, W_down]
+                - target_tensor: 
+                  - Single-variable, single-step: [H_down, W_down]
+                  - Single-variable, multi-step: [num_target_steps, H_down, W_down]
+                  - Multi-variable, single-step: [56, H_down, W_down]
+                  - Multi-variable, multi-step: [num_target_steps, 56, H_down, W_down]
             
             If include_upstream=True:
                 Tuple of (input_dict, target_tensor):
                 - input_dict: Dict with keys 'downstream' and 'upstream'
                   - 'downstream': [T, C, H_down, W_down]
                   - 'upstream': [T, C, H_up, W_up]
-                - target_tensor: Target precipitation [H_down, W_down]
+                - target_tensor: Same format as above
               
         Raises:
             IndexError: If idx is out of range.
@@ -926,7 +944,8 @@ class ConvLSTMDataset(Dataset):
         # Calculate time indices for this window
         start_time = idx
         end_time = idx + self.window_size
-        target_time = end_time + self.target_offset - 1
+        target_start_time = end_time + self.target_offset - 1
+        target_end_time = target_start_time + self.num_target_steps
         
         # Create input sequence
         if self.include_upstream:
@@ -965,11 +984,36 @@ class ConvLSTMDataset(Dataset):
             # Convert to PyTorch tensor
             input_data = torch.from_numpy(input_array).float()
         
-        # Get target (precipitation only, downstream region only)
-        target_precip = self.downstream_data["precipitation"].isel(
-            time=target_time
-        ).values  # Shape: (H_down, W_down)
-        
-        target_tensor = torch.from_numpy(target_precip).float()
+        # Get target based on mode
+        if self.multi_variable:
+            # Multi-variable mode: return all 56 channels
+            if self.num_target_steps == 1:
+                # Single-step multi-variable target
+                target_data = stack_channels(
+                    self.downstream_data,
+                    time_idx=target_start_time
+                )  # Shape: (56, H_down, W_down)
+            else:
+                # Multi-step multi-variable targets
+                target_data = stack_channels(
+                    self.downstream_data,
+                    time_slice=slice(target_start_time, target_end_time)
+                )  # Shape: (num_target_steps, 56, H_down, W_down)
+            
+            target_tensor = torch.from_numpy(target_data).float()
+        else:
+            # Single-variable mode: precipitation only (backward compatible)
+            if self.num_target_steps == 1:
+                # Single-step precipitation target
+                target_precip = self.downstream_data["precipitation"].isel(
+                    time=target_start_time
+                ).values  # Shape: (H_down, W_down)
+                target_tensor = torch.from_numpy(target_precip).float()
+            else:
+                # Multi-step precipitation targets
+                target_precip = self.downstream_data["precipitation"].isel(
+                    time=slice(target_start_time, target_end_time)
+                ).values  # Shape: (num_target_steps, H_down, W_down)
+                target_tensor = torch.from_numpy(target_precip).float()
         
         return input_data, target_tensor

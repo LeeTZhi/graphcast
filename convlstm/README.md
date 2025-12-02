@@ -1536,3 +1536,229 @@ This implementation satisfies the following requirements:
 ✅ Comprehensive help text with examples
 ✅ Detailed documentation in TRAINING_GUIDE.md
 ✅ Organized argument groups for easy navigation
+
+
+## Multi-Variable Prediction
+
+The ConvLSTM module supports multi-variable prediction mode, which predicts all atmospheric variables (DPT, GPH, TEM, U, V) plus precipitation simultaneously, rather than just precipitation alone.
+
+### Overview
+
+**Single-Variable Mode (Default)**:
+- Predicts only precipitation (1 output channel)
+- Faster training and inference
+- Suitable for precipitation-focused applications
+
+**Multi-Variable Mode**:
+- Predicts all 56 channels (5 vars × 11 levels + precipitation)
+- Learns underlying atmospheric dynamics
+- Enables rolling forecasts for multi-step predictions
+- Better generalization through physical consistency
+
+### Quick Start
+
+#### Training Multi-Variable Model
+
+```bash
+# Enable multi-variable mode with --multi-variable flag
+python train_convlstm.py \
+    --data data/regional_weather.nc \
+    --output-dir checkpoints/multi_variable \
+    --multi-variable \
+    --batch-size 4 \
+    --num-epochs 100 \
+    --use-amp
+```
+
+#### Rolling Forecasts
+
+Multi-variable models support rolling forecasts (up to 6 steps = 3 days):
+
+```bash
+python run_inference_convlstm.py \
+    --checkpoint checkpoints/multi_variable/best_model.pt \
+    --data data/test_data.nc \
+    --output-dir predictions/rolling \
+    --rolling-steps 6 \
+    --visualize
+```
+
+### Configuration Parameters
+
+#### Core Parameters
+
+- `--multi-variable`: Enable multi-variable prediction mode (56 output channels)
+- `--precip-loss-weight`: Weight for precipitation vs atmospheric variables (default: 10.0)
+- `--max-rollout-steps`: Maximum rolling forecast steps (default: 6)
+- `--enable-rollout-training`: Enable autoregressive training for rolling forecasts
+
+#### Example Configurations
+
+```bash
+# Basic multi-variable training
+python train_convlstm.py --multi-variable --data data.nc --output-dir checkpoints/mv
+
+# Custom precipitation weighting
+python train_convlstm.py --multi-variable --precip-loss-weight 15.0 --data data.nc
+
+# Rolling forecast training
+python train_convlstm.py --multi-variable --enable-rollout-training --max-rollout-steps 3
+```
+
+### Loss Function
+
+Multi-variable mode uses a weighted loss function:
+
+```
+Total Loss = precip_weight × precip_loss + atmos_loss
+```
+
+Where:
+- **precip_loss**: Event-weighted MSE with latitude correction (same as single-variable)
+- **atmos_loss**: Standard MSE across 55 atmospheric channels
+- **precip_weight**: Configurable multiplier (default: 10.0)
+
+This ensures precipitation remains the primary target while learning atmospheric dynamics.
+
+### Rolling Forecasts
+
+Rolling forecasts enable multi-step predictions by iteratively feeding predictions back as inputs:
+
+```
+Initial: [t-5, t-4, t-3, t-2, t-1, t0] → Predict t1
+Step 1:  [t-4, t-3, t-2, t-1, t0, t1] → Predict t2
+Step 2:  [t-3, t-2, t-1, t0, t1, t2] → Predict t3
+...
+```
+
+**Requirements**:
+- Model must be trained with `--multi-variable`
+- Maximum 6 steps (3 days at 12-hour intervals)
+- Single-stream models only (dual-stream not yet supported)
+
+**Usage**:
+```bash
+# Generate 6-step rolling forecast
+python run_inference_convlstm.py \
+    --checkpoint checkpoints/multi_variable/best_model.pt \
+    --data data/test_data.nc \
+    --output-dir predictions/rolling_6steps \
+    --rolling-steps 6 \
+    --visualize
+```
+
+### Model Architecture
+
+All four model variants support multi-variable mode:
+- `ConvLSTMUNet` (base)
+- `DualStreamConvLSTMUNet` (dual-stream)
+- `DeepConvLSTMUNet` (deep)
+- `DeepDualStreamConvLSTMUNet` (deep dual-stream)
+
+The only change is the output layer dimension:
+- Single-variable: 1 output channel
+- Multi-variable: 56 output channels
+
+The encoder-decoder architecture remains unchanged, ensuring:
+- Same memory footprint
+- Same computational cost
+- Same training dynamics
+
+### Evaluation
+
+Evaluate multi-variable predictions with comprehensive metrics:
+
+```bash
+# Single-step evaluation
+python examples/evaluate_multi_variable.py \
+    --predictions predictions/multi_variable/predictions.nc \
+    --ground-truth data/test_data.nc \
+    --output-dir predictions/multi_variable/metrics
+
+# Rolling forecast evaluation
+python examples/evaluate_multi_variable.py \
+    --predictions predictions/rolling/predictions.nc \
+    --ground-truth data/test_data.nc \
+    --output-dir predictions/rolling/metrics \
+    --rolling-forecast
+```
+
+Metrics computed:
+- Per-variable RMSE and MAE (56 channels)
+- Per-timestep metrics for rolling forecasts
+- Weighted aggregated scores
+- Precipitation-specific metrics (high/extreme events)
+
+### Backward Compatibility
+
+Multi-variable mode is fully backward compatible:
+
+- **Default behavior**: Omitting `--multi-variable` trains in single-variable mode
+- **Checkpoint loading**: Automatically detects mode from checkpoint
+- **Existing scripts**: Work without modification
+
+```bash
+# Single-variable mode (default, backward compatible)
+python train_convlstm.py --data data.nc --output-dir checkpoints/single
+
+# Multi-variable mode (opt-in)
+python train_convlstm.py --multi-variable --data data.nc --output-dir checkpoints/multi
+```
+
+### Example Scripts
+
+Comprehensive examples are provided:
+
+- `examples/train_multi_variable.sh`: Training examples for multi-variable mode
+- `examples/rolling_forecast.sh`: Rolling forecast examples
+- `examples/evaluate_multi_variable.py`: Evaluation script
+
+### Documentation
+
+For detailed documentation, see:
+
+- **Multi-Variable Guide**: `convlstm/MULTI_VARIABLE_GUIDE.md` - Comprehensive guide
+- **Evaluation Guide**: `convlstm/MULTI_VARIABLE_EVALUATION.md` - Evaluation metrics
+- **Rolling Forecast**: `docs/Rolling_forecast.md` - Theory and implementation
+- **Design Document**: `.kiro/specs/multi-variable-rolling-forecast/design.md`
+
+### Memory Optimization
+
+Multi-variable mode uses similar memory to single-variable mode. For memory-constrained GPUs:
+
+```bash
+python train_convlstm.py \
+    --multi-variable \
+    --batch-size 2 \
+    --gradient-accumulation-steps 4 \
+    --hidden-channels 32 64 \
+    --use-amp
+```
+
+Rolling forecast training requires more memory:
+
+```bash
+python train_convlstm.py \
+    --multi-variable \
+    --enable-rollout-training \
+    --max-rollout-steps 2 \
+    --batch-size 2 \
+    --gradient-accumulation-steps 4 \
+    --gradient-clip-norm 1.0
+```
+
+### Troubleshooting
+
+**Issue**: Out of memory during training
+**Solution**: Reduce batch size, use gradient accumulation, reduce rollout steps
+
+**Issue**: Rolling forecast not supported
+**Solution**: Train model with `--multi-variable` flag
+
+**Issue**: Dual-stream rolling forecast error
+**Solution**: Use single-stream model for rolling forecasts
+
+**Issue**: Poor precipitation accuracy
+**Solution**: Increase `--precip-loss-weight` (e.g., 15.0 or 20.0)
+
+For more troubleshooting tips, see `convlstm/MULTI_VARIABLE_GUIDE.md`.

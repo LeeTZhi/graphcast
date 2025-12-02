@@ -229,3 +229,96 @@ Use of the third-party materials referred to above may be governed by separate t
 ## Contact
 
 For feedback and questions, contact us at gencast@google.com.
+
+
+## ConvLSTM: Regional Weather Prediction
+
+This package also includes a ConvLSTM-based regional weather prediction system for precipitation forecasting using spatio-temporal atmospheric data.
+
+### Features
+
+- **ConvLSTM U-Net Architecture**: Encoder-decoder with skip connections for spatial-temporal prediction
+- **Multi-Variable Prediction**: Predict all atmospheric variables (DPT, GPH, TEM, U, V) plus precipitation simultaneously
+- **Rolling Forecasts**: Multi-step predictions up to 6 timesteps (3 days) ahead
+- **Memory Optimized**: Designed for 12GB GPU memory constraints
+- **Multiple Model Variants**: Base, deep, dual-stream, and deep dual-stream architectures
+
+### Quick Start
+
+#### Training
+
+```bash
+# Single-variable mode (precipitation only)
+python train_convlstm.py \
+    --data data/regional_weather.nc \
+    --output-dir checkpoints/baseline \
+    --batch-size 4 \
+    --num-epochs 100
+
+# Multi-variable mode (all atmospheric variables + precipitation)
+python train_convlstm.py \
+    --data data/regional_weather.nc \
+    --output-dir checkpoints/multi_variable \
+    --multi-variable \
+    --batch-size 4 \
+    --num-epochs 100
+```
+
+#### Inference
+
+```bash
+# Single-step prediction
+python run_inference_convlstm.py \
+    --checkpoint checkpoints/multi_variable/best_model.pt \
+    --data data/test_data.nc \
+    --output-dir predictions/single_step \
+    --visualize
+
+# Rolling forecast (multi-step)
+python run_inference_convlstm.py \
+    --checkpoint checkpoints/multi_variable/best_model.pt \
+    --data data/test_data.nc \
+    --output-dir predictions/rolling \
+    --rolling-steps 6 \
+    --visualize
+```
+
+### Multi-Variable Prediction
+
+Multi-variable mode predicts all 56 channels (5 atmospheric variables × 11 pressure levels + precipitation) simultaneously, enabling:
+
+- **Better Generalization**: Learns underlying atmospheric dynamics
+- **Physical Consistency**: Predictions respect physical relationships
+- **Rolling Forecasts**: Multi-step predictions by feeding outputs back as inputs
+- **Comprehensive Output**: Full atmospheric state, not just precipitation
+
+**Configuration Parameters**:
+- `--multi-variable`: Enable multi-variable prediction mode
+- `--precip-loss-weight`: Weight for precipitation vs atmospheric variables (default: 10.0)
+- `--max-rollout-steps`: Maximum rolling forecast steps (default: 6)
+- `--enable-rollout-training`: Enable autoregressive training
+
+### Documentation
+
+- **Module README**: `convlstm/README.md` - Complete module documentation
+- **Multi-Variable Guide**: `convlstm/MULTI_VARIABLE_GUIDE.md` - Comprehensive guide for multi-variable prediction
+- **Training Guide**: `convlstm/TRAINING_GUIDE.md` - Detailed training documentation
+- **Evaluation Guide**: `convlstm/MULTI_VARIABLE_EVALUATION.md` - Evaluation metrics and procedures
+- **Model Design**: `docs/ConvLSTM_model.md` - Architecture details
+- **Rolling Forecasts**: `docs/Rolling_forecast.md` - Theory and implementation
+
+### Example Scripts
+
+- `examples/train_convlstm_example.sh`: Training examples for single-variable mode
+- `examples/train_multi_variable.sh`: Training examples for multi-variable mode
+- `examples/rolling_forecast.sh`: Rolling forecast examples
+- `examples/evaluate_multi_variable.py`: Evaluation script
+
+### Requirements
+
+The ConvLSTM module requires:
+- PyTorch 1.9 or higher
+- xarray, numpy, pandas, matplotlib
+- CUDA-capable GPU with at least 8GB VRAM (12GB recommended)
+
+See `requirements_pytorch.txt` for complete dependencies.

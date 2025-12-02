@@ -4,10 +4,16 @@ This module implements evaluation metrics for assessing precipitation prediction
 accuracy in the downstream region. It provides RMSE, MAE, and CSI metrics that
 can be computed for both experiments (baseline and upstream) on the same region
 for fair comparison.
+
+For multi-variable predictions, it also provides per-variable and per-timestep
+metrics for comprehensive evaluation of atmospheric variables and rolling forecasts.
 """
 
+import csv
+import json
 import logging
-from typing import Dict, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -15,6 +21,26 @@ import xarray as xr
 
 
 logger = logging.getLogger(__name__)
+
+
+# Variable names for the 56 channels
+# Channels 0-54: Atmospheric variables (5 vars × 11 levels)
+# Channel 55: Precipitation
+PRESSURE_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 100]  # hPa
+ATMOSPHERIC_VARS = ['DPT', 'GPH', 'TEM', 'U', 'V']  # 5 variables
+
+def get_variable_names() -> List[str]:
+    """Get list of all 56 variable names in channel order.
+    
+    Returns:
+        List of variable names: ['DPT_1000', 'DPT_925', ..., 'V_100', 'precipitation']
+    """
+    var_names = []
+    for var in ATMOSPHERIC_VARS:
+        for level in PRESSURE_LEVELS:
+            var_names.append(f"{var}_{level}")
+    var_names.append("precipitation")
+    return var_names
 
 
 def compute_rmse(
@@ -505,3 +531,420 @@ def compute_metrics_from_xarray(
     )
     
     return metrics
+
+
+
+def compute_per_variable_metrics(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: Optional[torch.Tensor] = None
+) -> Dict[str, Dict[str, float]]:
+    """Compute RMSE and MAE for each variable separately in multi-variable predictions.
+    
+    This function computes per-variable metrics for all 56 channels:
+    - 55 atmospheric variables (5 vars × 11 pressure levels)
+    - 1 precipitation variable
+    
+    Args:
+        predictions: Predicted values [B, 56, H, W]
+        targets: Ground truth values [B, 56, H, W]
+        mask: Optional boolean mask for region [H, W] or [B, H, W]
+    
+    Returns:
+        Dictionary mapping variable names to their metrics:
+        {
+            'DPT_1000': {'rmse': 1.23, 'mae': 0.98},
+            'DPT_925': {'rmse': 1.45, 'mae': 1.12},
+            ...
+            'precipitation': {'rmse': 2.34, 'mae': 1.87}
+        }
+    
+    Raises:
+        ValueError: If predictions don't have 56 channels
+    """
+    if predictions.dim() != 4 or predictions.size(1) != 56:
+        raise ValueError(
+            f"Expected predictions shape [B, 56, H, W], got {predictions.shape}"
+        )
+    
+    if targets.dim() != 4 or targets.size(1) != 56:
+        raise ValueError(
+            f"Expected targets shape [B, 56, H, W], got {targets.shape}"
+        )
+    
+    var_names = get_variable_names()
+    metrics = {}
+    
+    logger.info("Computing per-variable metrics for 56 channels...")
+    
+    for channel_idx, var_name in enumerate(var_names):
+        # Extract single channel
+        pred_channel = predictions[:, channel_idx:channel_idx+1, :, :]  # [B, 1, H, W]
+        target_channel = targets[:, channel_idx, :, :]  # [B, H, W]
+        
+        # Compute metrics for this channel
+        rmse = compute_rmse(pred_channel, target_channel, mask)
+        mae = compute_mae(pred_channel, target_channel, mask)
+        
+        metrics[var_name] = {
+            'rmse': rmse,
+            'mae': mae
+        }
+    
+    logger.info(f"Computed metrics for {len(var_names)} variables")
+    
+    return metrics
+
+
+def compute_per_timestep_metrics(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: Optional[torch.Tensor] = None
+) -> Dict[int, Dict[str, float]]:
+    """Compute RMSE and MAE for each timestep in rolling forecast predictions.
+    
+    This function computes metrics separately for each predicted timestep
+    in a rolling forecast sequence.
+    
+    Args:
+        predictions: Predicted values [B, T, C, H, W] where T is number of timesteps
+        targets: Ground truth values [B, T, C, H, W]
+        mask: Optional boolean mask for region [H, W] or [B, H, W]
+    
+    Returns:
+        Dictionary mapping timestep to metrics:
+        {
+            1: {'rmse': 1.23, 'mae': 0.98},
+            2: {'rmse': 1.45, 'mae': 1.12},
+            ...
+        }
+    
+    Raises:
+        ValueError: If predictions don't have timestep dimension
+    """
+    if predictions.dim() != 5:
+        raise ValueError(
+            f"Expected predictions shape [B, T, C, H, W], got {predictions.shape}"
+        )
+    
+    if targets.dim() != 5:
+        raise ValueError(
+            f"Expected targets shape [B, T, C, H, W], got {targets.shape}"
+        )
+    
+    num_timesteps = predictions.size(1)
+    num_channels = predictions.size(2)
+    
+    logger.info(f"Computing per-timestep metrics for {num_timesteps} timesteps...")
+    
+    metrics = {}
+    
+    for t in range(num_timesteps):
+        # Extract timestep
+        pred_t = predictions[:, t, :, :, :]  # [B, C, H, W]
+        target_t = targets[:, t, :, :, :]  # [B, C, H, W]
+        
+        # For multi-channel predictions, compute overall metrics
+        # (average across all channels)
+        if num_channels == 1:
+            # Single-variable mode (precipitation only)
+            rmse = compute_rmse(pred_t, target_t.squeeze(1), mask)
+            mae = compute_mae(pred_t, target_t.squeeze(1), mask)
+        else:
+            # Multi-variable mode: compute metrics for all channels
+            # Flatten channel dimension for overall metric
+            pred_flat = pred_t.reshape(pred_t.size(0), -1, pred_t.size(-2), pred_t.size(-1))
+            target_flat = target_t.reshape(target_t.size(0), -1, target_t.size(-2), target_t.size(-1))
+            
+            # Compute average RMSE and MAE across all channels
+            rmse_sum = 0.0
+            mae_sum = 0.0
+            for c in range(num_channels):
+                rmse_sum += compute_rmse(pred_t[:, c:c+1, :, :], target_t[:, c, :, :], mask)
+                mae_sum += compute_mae(pred_t[:, c:c+1, :, :], target_t[:, c, :, :], mask)
+            
+            rmse = rmse_sum / num_channels
+            mae = mae_sum / num_channels
+        
+        metrics[t + 1] = {  # 1-indexed timesteps
+            'rmse': rmse,
+            'mae': mae
+        }
+        
+        logger.info(f"Timestep {t+1}: RMSE={rmse:.4f}, MAE={mae:.4f}")
+    
+    return metrics
+
+
+def compute_weighted_aggregated_score(
+    per_variable_metrics: Dict[str, Dict[str, float]],
+    precip_weight: float = 10.0
+) -> Dict[str, float]:
+    """Compute weighted aggregated scores across all variables.
+    
+    Computes overall RMSE and MAE by taking a weighted average where
+    precipitation receives higher weight than atmospheric variables.
+    
+    Args:
+        per_variable_metrics: Dictionary of per-variable metrics from compute_per_variable_metrics
+        precip_weight: Weight multiplier for precipitation (default: 10.0)
+    
+    Returns:
+        Dictionary with aggregated metrics:
+        {
+            'weighted_rmse': 2.34,
+            'weighted_mae': 1.87,
+            'precip_rmse': 3.45,
+            'precip_mae': 2.67,
+            'atmos_rmse': 1.23,
+            'atmos_mae': 0.98
+        }
+    """
+    # Separate precipitation and atmospheric metrics
+    precip_metrics = per_variable_metrics.get('precipitation', {})
+    
+    # Compute average atmospheric metrics
+    atmos_rmse_sum = 0.0
+    atmos_mae_sum = 0.0
+    atmos_count = 0
+    
+    for var_name, metrics in per_variable_metrics.items():
+        if var_name != 'precipitation':
+            atmos_rmse_sum += metrics['rmse']
+            atmos_mae_sum += metrics['mae']
+            atmos_count += 1
+    
+    atmos_rmse = atmos_rmse_sum / atmos_count if atmos_count > 0 else 0.0
+    atmos_mae = atmos_mae_sum / atmos_count if atmos_count > 0 else 0.0
+    
+    # Compute weighted average
+    # weighted_metric = (precip_weight * precip_metric + atmos_metric) / (precip_weight + 1)
+    precip_rmse = precip_metrics.get('rmse', 0.0)
+    precip_mae = precip_metrics.get('mae', 0.0)
+    
+    weighted_rmse = (precip_weight * precip_rmse + atmos_rmse) / (precip_weight + 1)
+    weighted_mae = (precip_weight * precip_mae + atmos_mae) / (precip_weight + 1)
+    
+    logger.info("Computed weighted aggregated scores:")
+    logger.info(f"  Weighted RMSE: {weighted_rmse:.4f}")
+    logger.info(f"  Weighted MAE: {weighted_mae:.4f}")
+    logger.info(f"  Precipitation RMSE: {precip_rmse:.4f}")
+    logger.info(f"  Precipitation MAE: {precip_mae:.4f}")
+    logger.info(f"  Atmospheric RMSE: {atmos_rmse:.4f}")
+    logger.info(f"  Atmospheric MAE: {atmos_mae:.4f}")
+    
+    return {
+        'weighted_rmse': weighted_rmse,
+        'weighted_mae': weighted_mae,
+        'precip_rmse': precip_rmse,
+        'precip_mae': precip_mae,
+        'atmos_rmse': atmos_rmse,
+        'atmos_mae': atmos_mae
+    }
+
+
+def evaluate_multi_variable_predictions(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    precip_weight: float = 10.0,
+    output_dir: Optional[Union[str, Path]] = None
+) -> Dict[str, any]:
+    """Comprehensive evaluation for multi-variable predictions.
+    
+    Computes:
+    1. Per-variable RMSE and MAE for all 56 channels
+    2. Weighted aggregated scores
+    3. Exports results to CSV/JSON if output_dir is provided
+    
+    Args:
+        predictions: Predicted values [B, 56, H, W]
+        targets: Ground truth values [B, 56, H, W]
+        mask: Optional boolean mask for region [H, W] or [B, H, W]
+        precip_weight: Weight for precipitation in aggregated scores (default: 10.0)
+        output_dir: Optional directory to save results as CSV/JSON
+    
+    Returns:
+        Dictionary containing:
+        {
+            'per_variable': {...},  # Per-variable metrics
+            'aggregated': {...}     # Weighted aggregated scores
+        }
+    """
+    logger.info("=" * 60)
+    logger.info("Multi-Variable Evaluation")
+    logger.info("=" * 60)
+    
+    # Compute per-variable metrics
+    per_variable_metrics = compute_per_variable_metrics(predictions, targets, mask)
+    
+    # Compute weighted aggregated scores
+    aggregated_metrics = compute_weighted_aggregated_score(per_variable_metrics, precip_weight)
+    
+    results = {
+        'per_variable': per_variable_metrics,
+        'aggregated': aggregated_metrics
+    }
+    
+    # Export results if output directory is provided
+    if output_dir is not None:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Export to CSV
+        csv_path = output_path / "multi_variable_metrics.csv"
+        export_metrics_to_csv(per_variable_metrics, csv_path)
+        logger.info(f"Exported per-variable metrics to {csv_path}")
+        
+        # Export to JSON
+        json_path = output_path / "multi_variable_metrics.json"
+        export_metrics_to_json(results, json_path)
+        logger.info(f"Exported all metrics to {json_path}")
+    
+    logger.info("=" * 60)
+    
+    return results
+
+
+def evaluate_rolling_forecast(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    precip_weight: float = 10.0,
+    output_dir: Optional[Union[str, Path]] = None
+) -> Dict[str, any]:
+    """Comprehensive evaluation for rolling forecast predictions.
+    
+    Computes:
+    1. Per-timestep metrics for each step in the rolling forecast
+    2. Per-variable metrics at each timestep (if multi-variable)
+    3. Exports results to CSV/JSON if output_dir is provided
+    
+    Args:
+        predictions: Predicted values [B, T, C, H, W] where T is number of timesteps
+        targets: Ground truth values [B, T, C, H, W]
+        mask: Optional boolean mask for region [H, W] or [B, H, W]
+        precip_weight: Weight for precipitation in aggregated scores (default: 10.0)
+        output_dir: Optional directory to save results as CSV/JSON
+    
+    Returns:
+        Dictionary containing:
+        {
+            'per_timestep': {...},           # Overall metrics per timestep
+            'per_timestep_per_variable': {...}  # Per-variable metrics at each timestep (if multi-variable)
+        }
+    """
+    logger.info("=" * 60)
+    logger.info("Rolling Forecast Evaluation")
+    logger.info("=" * 60)
+    
+    # Compute per-timestep metrics
+    per_timestep_metrics = compute_per_timestep_metrics(predictions, targets, mask)
+    
+    results = {
+        'per_timestep': per_timestep_metrics
+    }
+    
+    # If multi-variable, also compute per-variable metrics at each timestep
+    num_channels = predictions.size(2)
+    if num_channels == 56:
+        logger.info("\nComputing per-variable metrics at each timestep...")
+        per_timestep_per_variable = {}
+        
+        for t in range(predictions.size(1)):
+            pred_t = predictions[:, t, :, :, :]  # [B, 56, H, W]
+            target_t = targets[:, t, :, :, :]  # [B, 56, H, W]
+            
+            var_metrics = compute_per_variable_metrics(pred_t, target_t, mask)
+            per_timestep_per_variable[t + 1] = var_metrics
+        
+        results['per_timestep_per_variable'] = per_timestep_per_variable
+    
+    # Export results if output directory is provided
+    if output_dir is not None:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Export per-timestep metrics to CSV
+        csv_path = output_path / "rolling_forecast_metrics.csv"
+        export_timestep_metrics_to_csv(per_timestep_metrics, csv_path)
+        logger.info(f"Exported per-timestep metrics to {csv_path}")
+        
+        # Export all results to JSON
+        json_path = output_path / "rolling_forecast_metrics.json"
+        export_metrics_to_json(results, json_path)
+        logger.info(f"Exported all metrics to {json_path}")
+    
+    logger.info("=" * 60)
+    
+    return results
+
+
+def export_metrics_to_csv(
+    per_variable_metrics: Dict[str, Dict[str, float]],
+    output_path: Union[str, Path]
+) -> None:
+    """Export per-variable metrics to CSV file.
+    
+    Args:
+        per_variable_metrics: Dictionary of per-variable metrics
+        output_path: Path to output CSV file
+    """
+    output_path = Path(output_path)
+    
+    with open(output_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Write header
+        writer.writerow(['Variable', 'RMSE', 'MAE'])
+        
+        # Write data
+        for var_name, metrics in per_variable_metrics.items():
+            writer.writerow([
+                var_name,
+                f"{metrics['rmse']:.6f}",
+                f"{metrics['mae']:.6f}"
+            ])
+
+
+def export_timestep_metrics_to_csv(
+    per_timestep_metrics: Dict[int, Dict[str, float]],
+    output_path: Union[str, Path]
+) -> None:
+    """Export per-timestep metrics to CSV file.
+    
+    Args:
+        per_timestep_metrics: Dictionary of per-timestep metrics
+        output_path: Path to output CSV file
+    """
+    output_path = Path(output_path)
+    
+    with open(output_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Write header
+        writer.writerow(['Timestep', 'RMSE', 'MAE'])
+        
+        # Write data
+        for timestep, metrics in sorted(per_timestep_metrics.items()):
+            writer.writerow([
+                timestep,
+                f"{metrics['rmse']:.6f}",
+                f"{metrics['mae']:.6f}"
+            ])
+
+
+def export_metrics_to_json(
+    metrics: Dict,
+    output_path: Union[str, Path]
+) -> None:
+    """Export metrics to JSON file.
+    
+    Args:
+        metrics: Dictionary of metrics
+        output_path: Path to output JSON file
+    """
+    output_path = Path(output_path)
+    
+    with open(output_path, 'w') as jsonfile:
+        json.dump(metrics, jsonfile, indent=2)

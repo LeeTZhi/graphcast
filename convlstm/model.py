@@ -234,16 +234,18 @@ class ConvLSTMUNet(nn.Module):
                  output_channels: int = 1,
                  kernel_size: int = 3,
                  use_attention: bool = True,
-                 use_group_norm: bool = True):
+                 use_group_norm: bool = True,
+                 multi_variable: bool = False):
         """Initialize ConvLSTMUNet.
         
         Args:
             input_channels: Number of input channels (default: 56)
             hidden_channels: List of hidden dimensions (default: [32, 64])
-            output_channels: Number of output channels (default: 1)
+            output_channels: Number of output channels (default: 1, ignored if multi_variable=True)
             kernel_size: Size of convolutional kernel (default: 3)
             use_attention: Whether to use self-attention at bottleneck (default: True)
             use_group_norm: Whether to use Group Normalization in ConvLSTM cells (default: True)
+            multi_variable: Whether to predict all variables (56 channels) or just precipitation (1 channel) (default: False)
         """
         super(ConvLSTMUNet, self).__init__()
         
@@ -255,7 +257,8 @@ class ConvLSTMUNet(nn.Module):
         
         self.input_channels = input_channels
         self.hidden_channels = hidden_channels
-        self.output_channels = output_channels
+        self.multi_variable = multi_variable
+        self.output_channels = 56 if multi_variable else output_channels
         self.kernel_size = kernel_size
         self.use_attention = use_attention
         self.use_group_norm = use_group_norm
@@ -299,10 +302,10 @@ class ConvLSTMUNet(nn.Module):
             use_group_norm=use_group_norm
         )
         
-        # Output head: 1x1 convolution to map to precipitation
+        # Output head: 1x1 convolution to map to precipitation (or all variables in multi-variable mode)
         self.output_head = nn.Conv2d(
             in_channels=hidden_channels[0],
-            out_channels=output_channels,
+            out_channels=self.output_channels,
             kernel_size=1
         )
         
@@ -391,6 +394,96 @@ class ConvLSTMUNet(nn.Module):
         
         return output
 
+
+
+class MultiVariableLoss(nn.Module):
+    """Loss function for multi-variable prediction.
+    
+    Combines:
+    1. Weighted precipitation loss (existing WeightedPrecipitationLoss logic)
+    2. MSE loss for atmospheric variables
+    
+    Total loss = precip_weight * precip_loss + atmos_loss
+    
+    Attributes:
+        precip_loss_weight: Weight multiplier for precipitation vs atmospheric variables
+        precip_loss_fn: WeightedPrecipitationLoss instance for precipitation channel
+        atmos_loss_fn: MSE loss for atmospheric variables
+    """
+    
+    def __init__(self, 
+                 precip_loss_weight: float = 10.0,
+                 high_precip_threshold: float = 10.0,
+                 high_precip_weight: float = 5.0,
+                 extreme_precip_threshold: float = 50.0,
+                 extreme_precip_weight: float = 10.0,
+                 latitude_coords: Optional[np.ndarray] = None):
+        """Initialize MultiVariableLoss.
+        
+        Args:
+            precip_loss_weight: Weight for precipitation vs atmospheric variables (default: 10.0)
+            high_precip_threshold: Threshold (mm) for high precipitation (default: 10.0)
+            high_precip_weight: Weight multiplier for high precipitation (default: 5.0)
+            extreme_precip_threshold: Threshold (mm) for extreme precipitation (default: 50.0)
+            extreme_precip_weight: Weight multiplier for extreme precipitation (default: 10.0)
+            latitude_coords: Array of latitude values in degrees (default: None)
+        """
+        super().__init__()
+        
+        self.precip_loss_weight = precip_loss_weight
+        
+        # Reuse existing WeightedPrecipitationLoss for precipitation channel
+        self.precip_loss_fn = WeightedPrecipitationLoss(
+            high_precip_threshold=high_precip_threshold,
+            high_precip_weight=high_precip_weight,
+            extreme_precip_threshold=extreme_precip_threshold,
+            extreme_precip_weight=extreme_precip_weight,
+            latitude_coords=latitude_coords
+        )
+        
+        # Simple MSE for atmospheric variables
+        self.atmos_loss_fn = nn.MSELoss()
+    
+    def forward(self, predictions: torch.Tensor, 
+                targets: torch.Tensor) -> torch.Tensor:
+        """Compute multi-variable loss.
+        
+        Args:
+            predictions: Predicted values [B, C, H, W] where C is 1 or 56
+            targets: Ground truth values [B, H, W] (single-variable) or [B, C, H, W] (multi-variable)
+        
+        Returns:
+            Weighted loss scalar
+        """
+        # Handle single-variable mode (backward compatibility)
+        if predictions.size(1) == 1:
+            return self.precip_loss_fn(predictions, targets)
+        
+        # Multi-variable mode
+        # Channel 55 is precipitation, channels 0-54 are atmospheric variables
+        precip_pred = predictions[:, 55:56, :, :]  # [B, 1, H, W]
+        
+        # Handle targets shape - could be [B, 56, H, W] or [B, H, W]
+        if targets.dim() == 3:
+            # Single-channel target (backward compatibility)
+            precip_target = targets  # [B, H, W]
+            # For atmospheric variables, we can't compute loss without targets
+            # This shouldn't happen in multi-variable mode, but handle gracefully
+            return self.precip_loss_fn(precip_pred, precip_target)
+        else:
+            # Multi-channel target [B, 56, H, W]
+            precip_target = targets[:, 55, :, :]  # [B, H, W]
+            atmos_pred = predictions[:, :55, :, :]  # [B, 55, H, W]
+            atmos_target = targets[:, :55, :, :]  # [B, 55, H, W]
+        
+        # Compute losses
+        precip_loss = self.precip_loss_fn(precip_pred, precip_target)
+        atmos_loss = self.atmos_loss_fn(atmos_pred, atmos_target)
+        
+        # Weighted combination
+        total_loss = self.precip_loss_weight * precip_loss + atmos_loss
+        
+        return total_loss
 
 
 class WeightedPrecipitationLoss(nn.Module):
